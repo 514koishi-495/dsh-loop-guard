@@ -1,0 +1,16 @@
+# 依赖与构建产物
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# 运行期账本（插件自己的状态，不该进版本库）
+loop-guard-state.json
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+*~

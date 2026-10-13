@@ -1,0 +1,4 @@
+# 把「防烧钱守卫」挂进 DSH profile
+- insert:
+    - id: loop-guard
+      name: dsh-loop-guard

@@ -1,0 +1,2 @@
+# 仓库里一律存 LF，检出也是一律 LF —— 免得 Windows 上被换成 CRLF
+* text=auto eol=lf

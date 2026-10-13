@@ -1,0 +1,29 @@
+{
+  "name": "dsh-loop-guard",
+  "version": "1.1.3",
+  "private": true,
+  "description": "防烧钱守卫：同一调用循环拦截 + 单次问答 token 预算硬停手 + 交账报告",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "guard",
+    "budget"
+  ],
+  "license": "MIT"
+}

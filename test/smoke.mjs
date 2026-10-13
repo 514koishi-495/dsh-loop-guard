@@ -172,8 +172,12 @@ const allowed = (v) => v === undefined || v.kind !== 'deny';
 	const h = harness({ DSH_LOOP_GUARD_FAMILY_MAX_TOKENS: 200_000_000 });
 	const root = h.session('c-root');
 	const child = h.session('c-child', 'c-root');
-	// 分多轮累计到 2.8 亿：单轮都不碰 1 亿的本轮上限，走的才是家族闸门
-	for (const turn of [1, 2, 3, 4]) h.charge(child, 70_000_000, { turn });
+	// 分多轮累计到 2.8 亿：单轮谁都不碰 1 亿的本轮上限，走的才是家族闸门。
+	// 根会话每轮自己也要记一笔 —— 它不说话就没有 turn，换轮清账也就无从谈起。
+	for (const turn of [1, 2, 3, 4]) {
+		h.charge(root, 1_000_000, { turn });
+		h.charge(child, 70_000_000, { turn });
+	}
 	const onChild = await h.call({ name: 'read', arguments: { file_path: 'x' }, agent: { session: child } });
 	check('子代理自己会看到家族总量', isDeny(onChild, 'LOOP_GUARD_FAMILY_BUDGET'), JSON.stringify(onChild?.info));
 	const onRoot = await h.call({ name: 'read', arguments: { file_path: 'x' }, agent: { session: root } });

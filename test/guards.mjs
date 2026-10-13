@@ -166,6 +166,48 @@ const allowed = (v) => v === undefined || v.kind !== 'deny';
 	check('reject 是空决定（只有 kind，没有多余字段）', JSON.stringify(laterTurn) === '{"kind":"reject"}');
 }
 
+// ══════════ 1b. 单轮预算含子代理：自己这一轮 + 这一轮生出来的子代理 ══════════
+{
+	// 控制组：自己 6000 万 + 子代理 3000 万 = 9000 万，还没到 1 亿。
+	const ok = harness();
+	const okRoot = ok.plain('g1b-root');
+	const okChild = ok.sub('g1b-child', 'g1b-root');
+	ok.charge(okRoot, 60_000_000, 1);
+	ok.charge(okChild, 30_000_000, 1);
+	const stillOk = await ok.call(okRoot, 'read', { file_path: 'a.txt' });
+	check('本轮自己 6000 万 + 子代理 3000 万 = 9000 万，仍放行', allowed(stillOk), JSON.stringify(stillOk)?.slice(0, 60));
+
+	// 实验组：子代理换成 5000 万，合计 1.1 亿 —— 父自己下一次调用就该被拦。
+	const h = harness();
+	const root = h.plain('g1c-root');
+	const child = h.sub('g1c-child', 'g1c-root');
+	h.charge(root, 60_000_000, 1);
+	h.charge(child, 50_000_000, 1);
+	const over = await h.call(root, 'read', { file_path: 'b.txt' });
+	check('本轮含子代理越过 1 亿后被拦（只算自己的旧行为会放行）', isDeny(over, 'LOOP_GUARD_BUDGET_EXHAUSTED'));
+	check('拦的理由里点明子代理也算了', String(over?.reason ?? '').includes('子代理'));
+
+	// 子代理的账只该落在「它花钱时那一轮」。换轮之后必须归零，否则第一轮就会被永久拖累。
+	h.charge(root, 1_000_000, 2);
+	const nextTurn = await h.call(root, 'read', { file_path: 'c.txt' });
+	check('换到新一轮后，子代理上一轮的账不再算进本轮', allowed(nextTurn), JSON.stringify(nextTurn)?.slice(0, 60));
+
+	// 子代理自己的那一轮也一样：它生的孙代理要算进它的本轮预算。
+	const g = harness();
+	const gRoot = g.plain('g1d-root');
+	const gChild = g.sub('g1d-child', 'g1d-root');
+	const gGrand = g.sub('g1d-grand', 'g1d-child');
+	g.created(gChild);
+	g.created(gGrand);
+	g.charge(gRoot, 10_000_000, 1);
+	g.charge(gChild, 60_000_000, 1);
+	g.charge(gGrand, 50_000_000, 1);
+	const childOver = await g.call(gChild, 'read', { file_path: 'd.txt' });
+	check('孙代理的消耗也算进子代理自己的本轮预算', isDeny(childOver, 'LOOP_GUARD_BUDGET_EXHAUSTED'));
+	const rootFine = await g.call(gRoot, 'read', { file_path: 'e.txt' });
+	check('爷爷自己那轮只有 1000 万 + 孙辈 1.1 亿…… 一样会被拦', isDeny(rootFine, 'LOOP_GUARD_BUDGET_EXHAUSTED'));
+}
+
 // ══════════ 2. vetoNewTurn 默认关闭，显式关掉也不注册这个钩子 ══════════
 {
 	const byDefault = harness();

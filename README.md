@@ -2,7 +2,7 @@
 
 🔊 DSH 的一个本地插件。它不看内容、不调模型、不花一分钱，只做一件事：在工具调用真正发生之前，按几条纯算术的规则判断「这一步是不是又白烧钱」，是就拦下。
 
-装好之后，一次问答的累计计费输入到 10 亿 token 会硬停手，同一条命令反复跑会拦，两种写法乒乓循环会拦，同一个错误反复出现会拦，子代理扇出失控会拦。
+装好之后，一轮问答的累计计费输入（含这一轮生出来的子代理）到 1 亿、整个会话累计到 10 亿 token 会硬停手，同一条命令反复跑会拦，两种写法乒乓循环会拦，同一个错误反复出现会拦，子代理扇出失控会拦。
 
 **它不由模型自觉，它由代码执行。** 这跟 `~/.dsh/skills/no-waste-loop-guard/` 那个技能是配套的：技能负责「我自觉」，插件负责「我赖不掉」。
 
@@ -50,9 +50,9 @@ Copy-Item "$src\package.json","$src\cordis.patch.yml" -Destination $dst -Force
 
 | 闸门 | 触发条件 | 默认值 | 拦截码 |
 |---|---|---|---|
-| 本轮预算 | 本轮问答的计费输入到线 | 1 亿 | `LOOP_GUARD_BUDGET_EXHAUSTED` |
-| 会话总预算 | 整个会话跨轮累计到线 | 10 亿 | `LOOP_GUARD_SESSION_BUDGET` |
-| 家族预算 | 自己 + 所有后代的累计到线 | 不设限 | `LOOP_GUARD_FAMILY_BUDGET` |
+| 本轮预算 | 这一轮问答的计费输入到线 —— **含这一轮生出来的所有子代理** | 1 亿 | `LOOP_GUARD_BUDGET_EXHAUSTED` |
+| 会话总预算 | 整个会话跨轮累计到线（只算本会话自己） | 10 亿 | `LOOP_GUARD_SESSION_BUDGET` |
+| 家族预算 | 自己 + 所有后代的累计到线（不按轮重置） | 不设限 | `LOOP_GUARD_FAMILY_BUDGET` |
 | 同签名重复 | 同工具同参数（命令会归一化）反复调 | 4 次（`read` 5 次） | `LOOP_GUARD_REPEAT` |
 | 同骨架重复 | 只换数字/引号的同一件事。只对命令行生效；`read` 只折 `offset`/`limit`，路径原样保留；其余工具用精确签名 | 10 次 | `LOOP_GUARD_SKELETON` |
 | 乒乓循环 | A B A B A B 整体在打转 | 3 轮 | `LOOP_GUARD_CYCLE` |
@@ -66,6 +66,17 @@ Copy-Item "$src\package.json","$src\cordis.patch.yml" -Destination $dst -Force
 | 软着陆 | 到线后只拦贵的工具 | 关 | `LOOP_GUARD_SOFT_LANDING` |
 
 「计费输入」= `inputTokens + cacheReadTokens + cacheWriteTokens`，也就是钱按这个数算；`inputTokens` 只是没命中缓存的那一份，光看它会严重低报。
+
+### 预算里的三笔账，分别管哪一段时间
+
+- **本轮预算（默认 1 亿）** = 这一轮问答里，**自己 + 这一轮生出来的所有子代理（含孙辈）**。
+  子代理必须算进来：只算自己的话，一次对话可以自己烧满 1 亿，再让 8 个子代理各烧 1 亿，单轮上限就形同虚设。
+  它是**按轮清零**的 —— 子代理的消耗落在「它花钱时自己那一轮」，所以父会话换到下一轮，上一轮的子代理账就不算进新预算。
+  后台子代理（`run_in_background`）会跨轮活着，它的消耗落在「它花钱时父会话正处在的那一轮」，这是有意的：账跟着时间走，不跟着出生走。
+- **会话总预算（默认 10 亿）** = 只算**本会话自己**的跨轮累计，不含子代理。
+- **家族预算（默认不设限）** = 自己 + 所有后代的**跨轮**累计。想要「整个会话连同子代理不超过 10 亿」，把 `DSH_LOOP_GUARD_FAMILY_MAX_TOKENS` 设成 `1000000000`。
+
+一句话分工：**本轮 = 这一轮含后代；家族 = 整场含后代；会话 = 整场只算自己。**
 
 ### 「同一个错误」这条闸门到底认什么
 
@@ -97,9 +108,9 @@ Copy-Item "$src\package.json","$src\cordis.patch.yml" -Destination $dst -Force
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DSH_LOOP_GUARD_MAX_TOKENS` | `100000000` | 本轮上限 |
-| `DSH_LOOP_GUARD_SESSION_MAX_TOKENS` | `1000000000` | 会话累计上限；设 `0` = 不设限 |
-| `DSH_LOOP_GUARD_FAMILY_MAX_TOKENS` | 不设限 | 家族上限；设 `0` = 不设限 |
+| `DSH_LOOP_GUARD_MAX_TOKENS` | `100000000` | 本轮上限，**含该轮子代理** |
+| `DSH_LOOP_GUARD_SESSION_MAX_TOKENS` | `1000000000` | 会话累计上限，只算本会话自己；设 `0` = 不设限 |
+| `DSH_LOOP_GUARD_FAMILY_MAX_TOKENS` | 不设限 | 家族上限（自己 + 所有后代）；设 `0` = 不设限。想让「会话累计」也含后代，把它设成和会话上限一样的值 |
 | `DSH_LOOP_GUARD_WARN_RATIO` | `0.7` | 用到几成开始预警 |
 | `DSH_LOOP_GUARD_REPEAT_LIMIT` | `4` | 同签名 |
 | `DSH_LOOP_GUARD_READ_REPEAT_LIMIT` | `5` | 读文件单独放宽 |
@@ -139,9 +150,11 @@ Copy-Item "$src\package.json","$src\cordis.patch.yml" -Destination $dst -Force
 ```powershell
 $d = "$HOME\.dsh\local-plugins\dsh-loop-guard"
 node "$d\test\smoke.mjs"            # 35 项：老闸门
-node "$d\test\guards.mjs"           # 61 项：新闸门
+node "$d\test\guards.mjs"           # 67 项：新闸门（含「本轮预算算不算子代理」那几条）
 node "$d\test\persist.mjs" write    # 5 项：写得进去
 node "$d\test\persist.mjs" read     # 3 项：读得回来并据此拦人
+
+# 合计 110 项（35 + 67 + 5 + 3）
 ```
 
 测试全程不碰真账本（`DSH_LOOP_GUARD_STATE_FILE` 指向 `test/` 下的文件，并且默认 `NO_PERSIST`）。跨重启那一项必须分两个进程跑——账本是模块级的，一个进程里只能干净地测「写」或「读」。

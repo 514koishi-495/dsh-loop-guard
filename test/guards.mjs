@@ -61,10 +61,17 @@ const KEYS = [
 	'DSH_LOOP_GUARD_EMPTY_RESULT_TOKENS',
 	'DSH_LOOP_GUARD_EMPTY_RESULT_OUTPUT',
 	'DSH_LOOP_GUARD_MAX_BATCH_FAILURES',
+	'DSH_LOOP_GUARD_PURE_TALK_TOKENS',
+	'DSH_LOOP_GUARD_PURE_TALK_GUARD',
+	'DSH_LOOP_GUARD_SAME_ERROR_UNKNOWN_LIMIT',
 	'DSH_LOOP_GUARD_VETO_NEW_TURN',
 	'DSH_LOOP_GUARD_PERSIST',
 	'DSH_LOOP_GUARD_NO_PERSIST',
 	'DSH_LOOP_GUARD_SOFT_LANDING',
+	// 消耗估算的两个 env：一个开关、一张价目表。必须跟着别的配置一起清干净，
+	// 否则某个场景里关掉的 COST / 换掉的价目表会串到下一个场景。
+	'DSH_LOOP_GUARD_COST',
+	'DSH_LOOP_GUARD_PRICE_TABLE',
 	'DSH_LOOP_GUARD_OFF'
 ];
 
@@ -72,6 +79,16 @@ const results = [];
 const check = (label, ok, extra = '') => results.push([ok ? 'PASS' : 'FAIL', label, extra]);
 
 const next = async () => ({ kind: 'ok' });
+
+/** 一条只带 output 的 usage 事件：E1 纯输出门看的是 turnOutput，而 charge() 那个助手只喂 input。 */
+const outputUsage = (tokens, turn = 1) => ({
+	type: 'assistant/chunk',
+	data: {
+		turn,
+		step: 1,
+		chunk: { type: 'usage', usage: { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: tokens } }
+	}
+});
 
 function harness(env = {}, opts = {}) {
 	for (const key of KEYS) delete process.env[key];
@@ -111,6 +128,8 @@ function harness(env = {}, opts = {}) {
 		logs,
 		hasPre: typeof pre === 'function',
 		hasStep: typeof stepHandler === 'function',
+		/** 原样的 agent/pre-step handler：用来自己塞一个带 spy 的 next()，验证「放行」不是空话。 */
+		rawStep: stepHandler,
 		warned: (needle) => logs.some(([level, text]) => level === 'warn' && text.includes(needle)),
 		sub: (id, parent) => ({ id, header: { origin: 'subagent', parentSession: parent } }),
 		plain: (id) => ({ id }),
@@ -224,7 +243,9 @@ async function httpGet(handler, url) {
 {
 	// vetoNewTurn 默认是关的（reject 是空决定，会把用户闷在一个没有解释的死胡同里），
 	// 所以这个场景要显式打开它。
-	const h = harness({ DSH_LOOP_GUARD_VETO_NEW_TURN: 1 });
+	// 这一块测的是**会话**预算（默认 10 亿）：本轮上限显式抬到 10 亿，
+	// 否则 90M/轮 已经越过单轮 60M 的硬顶，本轮门先响，测到的就不是会话门了。
+	const h = harness({ DSH_LOOP_GUARD_VETO_NEW_TURN: 1, DSH_LOOP_GUARD_MAX_TOKENS: 1_000_000_000 });
 	const s = h.plain('g1-root');
 	for (let turn = 1; turn <= 10; turn += 1) h.charge(s, 90_000_000, turn);
 	const at900 = await h.call(s, 'read', { file_path: 'a.txt' });
@@ -244,23 +265,23 @@ async function httpGet(handler, url) {
 
 // ══════════ 1b. 单轮预算含子代理：自己这一轮 + 这一轮生出来的子代理 ══════════
 {
-	// 控制组：自己 6000 万 + 子代理 3000 万 = 9000 万，还没到 1 亿。
+	// 控制组：自己 2500 万 + 子代理 2500 万 = 5000 万，还没到默认的 6000 万。
 	const ok = harness();
 	const okRoot = ok.plain('g1b-root');
 	const okChild = ok.sub('g1b-child', 'g1b-root');
-	ok.charge(okRoot, 60_000_000, 1);
-	ok.charge(okChild, 30_000_000, 1);
+	ok.charge(okRoot, 25_000_000, 1);
+	ok.charge(okChild, 25_000_000, 1);
 	const stillOk = await ok.call(okRoot, 'read', { file_path: 'a.txt' });
-	check('本轮自己 6000 万 + 子代理 3000 万 = 9000 万，仍放行', allowed(stillOk), JSON.stringify(stillOk)?.slice(0, 60));
+	check('本轮自己 2500 万 + 子代理 2500 万 = 5000 万，仍放行', allowed(stillOk), JSON.stringify(stillOk)?.slice(0, 60));
 
-	// 实验组：子代理换成 5000 万，合计 1.1 亿 —— 父自己下一次调用就该被拦。
+	// 实验组：子代理换成 4000 万，合计 6500 万 —— 越过默认 6000 万，父自己下一次调用就该被拦。
 	const h = harness();
 	const root = h.plain('g1c-root');
 	const child = h.sub('g1c-child', 'g1c-root');
-	h.charge(root, 60_000_000, 1);
-	h.charge(child, 50_000_000, 1);
+	h.charge(root, 25_000_000, 1);
+	h.charge(child, 40_000_000, 1);
 	const over = await h.call(root, 'read', { file_path: 'b.txt' });
-	check('本轮含子代理越过 1 亿后被拦（只算自己的旧行为会放行）', isDeny(over, 'LOOP_GUARD_BUDGET_EXHAUSTED'));
+	check('本轮含子代理越过 6000 万后被拦（只算自己的旧行为会放行）', isDeny(over, 'LOOP_GUARD_BUDGET_EXHAUSTED'));
 	check('拦的理由里点明子代理也算了', String(over?.reason ?? '').includes('子代理'));
 
 	// 子代理的账只该落在「它花钱时那一轮」。换轮之后必须归零，否则第一轮就会被永久拖累。
@@ -284,13 +305,57 @@ async function httpGet(handler, url) {
 	check('爷爷自己那轮只有 1000 万 + 孙辈 1.1 亿…… 一样会被拦', isDeny(rootFine, 'LOOP_GUARD_BUDGET_EXHAUSTED'));
 }
 
-// ══════════ 2. vetoNewTurn 默认关闭，显式关掉也不注册这个钩子 ══════════
+// ══════════ 2. agent/pre-step 无条件注册，但默认不否决 ══════════
+//
+// 1.1.7 起这个钩子是**无条件**注册的（纯输出门要靠它停止生成）。
+// 「用户不会被静默否决」这条安全属性必须继续成立，所以这里断言的是**行为**：
+// 注册了不等于会否决 —— 默认条件下它必须放行，并且把 next() 交回去。
 {
 	const byDefault = harness();
-	check('默认不注册 agent/pre-step（免得用户被静默否决）', byDefault.hasStep === false);
+	check('默认注册了 agent/pre-step（纯输出门需要它）', byDefault.hasStep === true);
+	const s = byDefault.plain('veto-default-root');
+	let nextCalled = 0;
+	const verdict = await byDefault.rawStep({ agent: { session: s }, turn: 1, step: 1, signal: undefined }, async () => {
+		nextCalled += 1;
+		return { kind: 'ok' };
+	});
+	check(
+		'默认不否决：不返回 reject，且真的放行（next 被调用）',
+		verdict?.kind !== 'reject' && nextCalled === 1,
+		`verdict=${JSON.stringify(verdict)} nextCalled=${nextCalled}`
+	);
 
 	const h = harness({ DSH_LOOP_GUARD_VETO_NEW_TURN: 0 });
-	check('关掉 vetoNewTurn 后不注册 agent/pre-step', h.hasStep === false);
+	check('显式关掉 vetoNewTurn 时这个钩子照样在（注册与否不是开关的语义）', h.hasStep === true);
+	const s2 = h.plain('veto-off-root');
+	let nextCalled2 = 0;
+	const verdict2 = await h.rawStep({ agent: { session: s2 }, turn: 2, step: 1, signal: undefined }, async () => {
+		nextCalled2 += 1;
+		return { kind: 'ok' };
+	});
+	check(
+		'关掉 vetoNewTurn 后同样不否决（不返回 reject，且真的放行）',
+		verdict2?.kind !== 'reject' && nextCalled2 === 1,
+		`verdict=${JSON.stringify(verdict2)} nextCalled=${nextCalled2}`
+	);
+
+	// 反证：上面两条不是「这个钩子永远放行」的空断言 ——
+	// 把 vetoNewTurn 打开、并且真的把会话预算烧穿，它必须否决新一轮。
+	const armed = harness({ DSH_LOOP_GUARD_VETO_NEW_TURN: 1, DSH_LOOP_GUARD_SESSION_MAX_TOKENS: 1, DSH_LOOP_GUARD_MAX_DENIALS: 99 });
+	const s3 = armed.plain('veto-armed-root');
+	armed.charge(s3, 5_000_000, 1);
+	const tripped = await armed.call(s3, 'read', { file_path: 'x.txt' });
+	check('反证前置：先把会话预算烧穿（会话门拦下）', isDeny(tripped, 'LOOP_GUARD_SESSION_BUDGET'), brief(tripped));
+	let nextCalled3 = 0;
+	const veto = await armed.rawStep({ agent: { session: s3 }, turn: 2, step: 1, signal: undefined }, async () => {
+		nextCalled3 += 1;
+		return { kind: 'ok' };
+	});
+	check(
+		'反证：开着 vetoNewTurn 且已熔断时，新一轮真的被否决（reject 且不放行）',
+		veto?.kind === 'reject' && nextCalled3 === 0,
+		`verdict=${JSON.stringify(veto)} nextCalled=${nextCalled3}`
+	);
 }
 
 // ══════════ 2b. 同骨架只该管命令行，不该误伤「一批不同的文件」 ══════════
@@ -1137,7 +1202,7 @@ const QUOTA_BASE = {
 	check('已知会话：200 + ok:true', known.status === 200 && body.ok === true, `${known.status} ${String(known.raw).slice(0, 120)}`);
 	check('session.totalInput = 1000000', body.session?.totalInput === 1_000_000, JSON.stringify(body.session));
 	check('turn.total = 本轮输入（input + familyTurnInput）', body.turn?.total === 1_000_000, JSON.stringify(body.turn));
-	check('limits 带 maxTokens / sessionMaxTokens', body.limits?.maxTokens === 100_000_000 && body.limits?.sessionMaxTokens === 1_000_000_000, JSON.stringify(body.limits));
+	check('limits 带 maxTokens / sessionMaxTokens', body.limits?.maxTokens === 60_000_000 && body.limits?.sessionMaxTokens === 1_000_000_000, JSON.stringify(body.limits));
 	check(
 		'tripped 是三个布尔（turn / session / family），不是数组',
 		typeof body.tripped?.turn === 'boolean' && typeof body.tripped?.session === 'boolean' && typeof body.tripped?.family === 'boolean',
@@ -1191,12 +1256,1826 @@ const QUOTA_BASE = {
 	check('记账异常之后闸门照常工作', allowed(await h2.call(s2, 'read', { file_path: 'after-throw.txt' })), '');
 }
 
+// ══════════ 27. E1 纯输出门：命中条件 / 停止生成 + deny / 白名单永远放行 ══════════
+{
+	const relax = {
+		DSH_LOOP_GUARD_PURE_TALK_TOKENS: 1000,
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 99,
+		DSH_LOOP_GUARD_CYCLE_LIMIT: 99,
+		DSH_LOOP_GUARD_MAX_DENIALS: 99
+	};
+
+	// (1) 命中：本轮没有任何工具调用，只累计 output ≥ 阈值（**经典情形**：旧口径也命中）
+	const h = harness({ ...relax });
+	const s = h.plain('e1-hit');
+	h.event(s, outputUsage(5000, 1));
+	const veto = await h.step(s, 1);
+	check('E1 命中：agent/pre-step 返回 reject（停止生成）', veto?.kind === 'reject', JSON.stringify(veto));
+	const denied = await h.call(s, 'write', { file_path: 'x.txt' });
+	check('E1 命中：非白名单工具被 deny，code = LOOP_GUARD_SETTLE_REQUIRED', isDeny(denied, 'LOOP_GUARD_SETTLE_REQUIRED'), brief(denied));
+	check(
+		'E1 命中：拒绝文案里带门类别与数值（5000 / 阈值 1000）',
+		['只有输出', '5000', '1000'].every((needle) => String(denied?.reason ?? '').includes(needle)),
+		String(denied?.reason ?? '').split('\n')[0]
+	);
+	const secondDeny = await h.call(s, 'edit', { file_path: 'y.txt' });
+	check('E1 命中：同一轮第二次拒绝换成一行短版', isDeny(secondDeny, 'LOOP_GUARD_SETTLE_REQUIRED') && !String(secondDeny.reason).includes('\n'), String(secondDeny?.reason ?? ''));
+	const wl = [await h.call(s, 'todo_write', { todos: [] }), await h.call(s, 'get_goal', {}), await h.call(s, 'search_context', { query: 'x' })];
+	check('E1 白名单（NEVER_BLOCK）永远放行：交账/诊断手段不能被一起堵死', wl.every(allowed), seqBrief(wl));
+
+	// (2) 命中：**先真执行过一次工具调用**（游标推进），此后只累计输出 ≥ 阈值 → 照常命中。
+	//     旧口径（`turnToolCalls === 0`）在这一段是**放行**的 —— 这条断言就是新判据的判别力所在：
+	//     「先调一次工具、再狂喷输出打转」不再能靠一次工具调用买到整轮的免检。
+	const h2 = harness({ ...relax });
+	const s2 = h2.plain('e1-tooled');
+	const tooled = await h2.call(s2, 'write', { file_path: 'ok.txt' });
+	h2.event(s2, outputUsage(5000, 1));
+	const tooledStep = await h2.step(s2, 1);
+	const tooledAgain = await h2.call(s2, 'edit', { file_path: 'ok2.txt' });
+	check('E1 新判据：先真执行过一次工具调用、此后只输出到量 → 照常命中（停止生成 + 拦工具）', allowed(tooled) && tooledStep?.kind === 'reject' && isDeny(tooledAgain, 'LOOP_GUARD_SETTLE_REQUIRED'), seqBrief([tooled, tooledStep, tooledAgain]));
+	check(
+		'E1 新判据：文案说的是「自本轮上一次真的执行过工具调用以来」（不再说「一次工具调用都没有」）',
+		['自本轮上一次真的执行过工具调用以来', '这期间没有再执行过工具'].every((needle) => String(tooledAgain?.reason ?? '').includes(needle)) && !String(tooledAgain?.reason ?? '').includes('一次非白名单工具调用都没有'),
+		String(tooledAgain?.reason ?? '').split('\n')[1] ?? ''
+	);
+
+	// (3) 负例：**工具与输出交替**（每次输出都没到阈值）→ 一次都不命中。
+	//     证明「一边干活一边产出」不受影响：每执行一次工具，判据的起点就重新起算。
+	const h3 = harness({ ...relax });
+	const s3 = h3.plain('e1-alternate');
+	const round1 = await h3.call(s3, 'write', { file_path: 'a1.txt' });
+	h3.event(s3, outputUsage(600, 1));
+	const quietStep1 = await h3.step(s3, 1);
+	const round2 = await h3.call(s3, 'edit', { file_path: 'a2.txt' });
+	h3.event(s3, outputUsage(700, 1));
+	const quietStep2 = await h3.step(s3, 1);
+	const round3 = await h3.call(s3, 'edit', { file_path: 'a3.txt' });
+	check(
+		'E1 负例：工具与输出交替（每次输出 600/700 都没到阈值 1000）→ 不命中（本轮总输出已 1300，只看累计量早就误伤了）',
+		[round1, quietStep1, round2, quietStep2, round3].every(allowed),
+		seqBrief([round1, quietStep1, round2, quietStep2, round3])
+	);
+
+	// (4) 只满足一半：没调过工具，但输出没到阈值
+	const h4 = harness({ ...relax });
+	const s4 = h4.plain('e1-quiet');
+	h4.event(s4, outputUsage(500, 1));
+	const quietStep = await h4.step(s4, 1);
+	const quietCall = await h4.call(s4, 'write', { file_path: 'q.txt' });
+	check('E1 只满足一半不算：没调工具但输出没到阈值 → 不拦', allowed(quietStep) && allowed(quietCall), seqBrief([quietStep, quietCall]));
+
+	// (5) 两个开关：都关掉这道门（计数与统计照旧）
+	const offGuard = harness({ ...relax, DSH_LOOP_GUARD_PURE_TALK_GUARD: 0 });
+	const og = offGuard.plain('e1-off-guard');
+	offGuard.event(og, outputUsage(5000, 1));
+	const ogStep = await offGuard.step(og, 1);
+	const ogCall = await offGuard.call(og, 'write', { file_path: 'x.txt' });
+	check(
+		'E1 开关：DSH_LOOP_GUARD_PURE_TALK_GUARD=0 → 这道门不动作（不否决、不拦、不告警）',
+		allowed(ogStep) && allowed(ogCall) && !offGuard.warned('纯输出门命中'),
+		seqBrief([ogStep, ogCall])
+	);
+	const offTokens = harness({ ...relax, DSH_LOOP_GUARD_PURE_TALK_TOKENS: 0 });
+	const ot = offTokens.plain('e1-off-tokens');
+	offTokens.event(ot, outputUsage(5_000_000, 1));
+	const otStep = await offTokens.step(ot, 1);
+	const otCall = await offTokens.call(ot, 'write', { file_path: 'x.txt' });
+	check(
+		'E1 开关：DSH_LOOP_GUARD_PURE_TALK_TOKENS=0 → 这道门不动作',
+		allowed(otStep) && allowed(otCall) && !offTokens.warned('纯输出门命中'),
+		seqBrief([otStep, otCall])
+	);
+
+	// ── 记账口径（P1-1 的回归）：只读用量端点读计数，别拿内存账本当断言 ───────────────
+	// 「被拦下的调用不记账」这件事的判别力就落在 E1a 上：E1a 拦下的调用走不到任何放行出口，
+	// 所以它既不加 `toolCalls`、也不推水位游标 —— 命中之后每一条非白名单调用都还该被拦。
+	/** 带用量端点的 harness：断言只读那本账（工具调用数），不去读内存里的账本。 */
+	const endpointHarness = (env) => {
+		const registered = [];
+		const h = harness(env, {
+			webServer: {
+				register(spec) {
+					registered.push(spec);
+					return () => undefined;
+				}
+			}
+		});
+		return {
+			h,
+			usage: async (sessionId) => (await httpGet(registered[0].handler, `/api/loop-guard/usage?sessionId=${encodeURIComponent(sessionId)}`)).body?.session ?? {}
+		};
+	};
+
+	// (6) 被 ⓪ 拦下的调用：`toolCalls` 一个都不加（否则徽标与配额会被没执行过的调用吃掉）
+	const six = endpointHarness(relax);
+	const s6 = six.h.plain('e1-account-hit');
+	six.h.event(s6, outputUsage(5000, 1));
+	const sixDeny1 = await six.h.call(s6, 'write', { file_path: 'acct1.txt' });
+	const sixDeny2 = await six.h.call(s6, 'edit', { file_path: 'acct2.txt' });
+	const sixUsage = await six.usage('e1-account-hit');
+	check(
+		'E1 记账：被纯输出门拦下的调用不记 `toolCalls`，而且拦第二次时判据一个字节都没变（仍命中）',
+		isDeny(sixDeny1, 'LOOP_GUARD_SETTLE_REQUIRED') && isDeny(sixDeny2, 'LOOP_GUARD_SETTLE_REQUIRED') && sixUsage.toolCalls === 0,
+		`${seqBrief([sixDeny1, sixDeny2])} toolCalls=${String(sixUsage.toolCalls)}`
+	);
+
+	// (7) 放行执行的调用：`toolCalls` +1（而 `turnToolCalls` 一 +1，水位游标就重新起算）
+	const seven = endpointHarness(relax);
+	const s7 = seven.h.plain('e1-account-allow');
+	const sevenAllow = await seven.h.call(s7, 'write', { file_path: 'acct-ok.txt' });
+	const sevenAfter = await seven.usage('e1-account-allow');
+	check(
+		'E1 记账：放行执行的调用 `toolCalls` 恰好 +1',
+		allowed(sevenAllow) && sevenAfter.toolCalls === 1,
+		`${brief(sevenAllow)} toolCalls=${String(sevenAfter.toolCalls)}`
+	);
+	// 反证「真的干过活」与「单纯执行」不是同一个计数：同一会话接着狂输出，照样命中。
+	seven.h.event(s7, outputUsage(5000, 1));
+	const sevenDeny = await seven.h.call(s7, 'edit', { file_path: 'acct-ok2.txt' });
+	check('E1 记账：「干活」与「执行」不是一个计数 —— 执行过一次之后再狂输出照样命中', isDeny(sevenDeny, 'LOOP_GUARD_SETTLE_REQUIRED'), brief(sevenDeny));
+
+	// (8) 交账白名单工具：`toolCalls` +1，但「本轮干过活」计数**不变**（水位游标不动）。
+	//     反证：白名单之外的活（edit）依旧会被拦 —— 如果交账工具推了游标，下面这一条就该放行。
+	const eight = endpointHarness(relax);
+	const s8 = eight.h.plain('e1-account-whitelist');
+	const eightTool = await eight.h.call(s8, 'write', { file_path: 'wl-ok.txt' });
+	const eightTodo = await eight.h.call(s8, 'todo_write', { todos: [] });
+	eight.h.event(s8, outputUsage(5000, 1));
+	const eightDeny = await eight.h.call(s8, 'edit', { file_path: 'wl-after.txt' });
+	const eightUsage = await eight.usage('e1-account-whitelist');
+	check(
+		'E1 记账：交账白名单工具 `toolCalls` +1，但「本轮干过活」计数不变（E1a 交账之后照常命中）',
+		[eightTool, eightTodo].every(allowed) && isDeny(eightDeny, 'LOOP_GUARD_SETTLE_REQUIRED') && eightUsage.toolCalls === 2,
+		`${seqBrief([eightTool, eightTodo, eightDeny])} toolCalls=${String(eightUsage.toolCalls)}`
+	);
+
+	// (9) 被 ⑪ 同签名门拦下的一次调用：`toolCalls` 不 +1。
+	//     区分力：两次同签名调用里**只有第一次真的执行过**，第二次是被拦的重复调用。
+	const nine = endpointHarness({ ...relax, DSH_LOOP_GUARD_REPEAT_LIMIT: 1, DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 1 });
+	const s9 = nine.h.plain('e1-account-repeat');
+	const nineFirst = await nine.h.call(s9, 'read', { file_path: 'same-acct.txt' });
+	const nineSecond = await nine.h.call(s9, 'read', { file_path: 'same-acct.txt' });
+	const nineUsage = await nine.usage('e1-account-repeat');
+	check(
+		'E1 记账：被 ⑪ 同签名门拦下的调用不加 `toolCalls`（只有那一次真的执行过）',
+		allowed(nineFirst) && isDeny(nineSecond, 'LOOP_GUARD_REPEAT') && nineUsage.toolCalls === 1,
+		`${seqBrief([nineFirst, nineSecond])} toolCalls=${String(nineUsage.toolCalls)}`
+	);
+}
+
+// ══════════ 28. E2 拒绝文案：同一道门首次完整 / 后续一行短版 ══════════
+{
+	const h = harness({
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 1,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 1,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 99,
+		DSH_LOOP_GUARD_MAX_DENIALS: 99
+	});
+	const s = h.plain('e2-repeat');
+	await h.call(s, 'read', { file_path: 'same.txt' });
+	const full = await h.call(s, 'read', { file_path: 'same.txt' });
+	const short = await h.call(s, 'read', { file_path: 'same.txt' });
+	check(
+		'E2 同一道门首次拒绝：完整文案（多行、说清根因和怎么出去）',
+		isDeny(full, 'LOOP_GUARD_REPEAT') && String(full.reason).includes('\n') && full.reason.length > String(short.reason).length,
+		`${brief(full)} 行数=${String(full?.reason ?? '').split('\n').length}`
+	);
+	check(
+		'E2 同一道门后续拒绝：一行短版（含门类别、关键数值与要它做什么）',
+		isDeny(short, 'LOOP_GUARD_REPEAT') && !String(short.reason).includes('\n') && short.reason.includes('【防烧钱 · ') && short.reason.includes('阈值'),
+		String(short?.reason ?? '')
+	);
+	check('E2 重复签名类：完整版与短版都保留「放行那一次紧接着原样再发也放行」这句承诺', full.reason.includes('紧接着') && short.reason.includes('紧接着'), '');
+
+	// 配额类（一次性豁免那一类）不得出现这句承诺
+	const q = harness({
+		DSH_LOOP_GUARD_MAX_SUBAGENT_REQUESTS: 1,
+		DSH_LOOP_GUARD_MAX_DENIALS: 99,
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 99
+	});
+	const sub = q.sub('e2-sub', 'e2-root');
+	q.created(sub);
+	q.modelCall(sub);
+	const exempted = await q.call(sub, 'read', { file_path: 'q1.txt' });
+	const blocked = await q.call(sub, 'read', { file_path: 'q2.txt' });
+	check('E2 配额类：首次超配额走一次性豁免（放行一次）', allowed(exempted) && q.warned('一次性豁免'), brief(exempted));
+	check(
+		'E2 配额类文案里不得出现「原样再发也放行」这句承诺',
+		isDeny(blocked, 'LOOP_GUARD_SUBAGENT_REQUESTS') && !String(blocked.reason).includes('紧接着') && !String(blocked.reason).includes('原样再发'),
+		brief(blocked)
+	);
+}
+
+// ══════════ 29. E4 统计三处计数 + 会话收尾 info 摘要 ══════════
+{
+	const h = harness({
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 1,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 1,
+		DSH_LOOP_GUARD_MAX_DENIALS: 1,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 99,
+		DSH_LOOP_GUARD_MAX_FANOUT: 1
+	});
+	const s = h.plain('e4-root');
+	const liveChild = h.sub('e4-child', 'e4-root');
+	h.created(liveChild);
+	await h.call(s, 'read', { file_path: 'same.txt' });
+	const denied = await h.call(s, 'read', { file_path: 'same.txt' });
+	const released = await h.call(s, 'read', { file_path: 'same.txt' });
+	check('E4 亲拦计数：第 2 次被拦', isDeny(denied, 'LOOP_GUARD_REPEAT'), brief(denied));
+	check('E4 逃生门放行计数：第 3 次按保险丝放行一次', allowed(released) && h.warned('逃生门放行'), brief(released));
+	const exempted = await h.call(s, 'subagent', { prompt: 'x' });
+	check('E4 配额豁免计数：扇出上限 1、已活着 1 个 → 首次超配额一次性豁免', allowed(exempted) && h.warned('一次性豁免'), brief(exempted));
+	h.disposed(s);
+	const summary = h.logs.find(([level, text]) => level === 'info' && text.includes('会话收尾摘要'))?.[1] ?? '';
+	check('E4 会话收尾写一条 info 摘要：被拦 / 放行 / 豁免', summary.includes('被拦 1 次') && summary.includes('逃生门放行 1 次') && summary.includes('配额豁免 1 次'), summary);
+	check('E4 摘要还带请求数、轮次与 token 量', summary.includes('模型请求') && summary.includes('轮次') && summary.includes('累计计费输入') && summary.includes('token'), summary);
+}
+
+// ══════════ 30. B2 受限降级：认不出报错工具名时只让这一分支失效 ══════════
+{
+	const h = harness({
+		DSH_LOOP_GUARD_SAME_ERROR_LIMIT: 1,
+		DSH_LOOP_GUARD_SAME_ERROR_UNKNOWN_LIMIT: 3,
+		DSH_LOOP_GUARD_MAX_DENIALS: 9,
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 99,
+		DSH_LOOP_GUARD_CYCLE_LIMIT: 99,
+		DSH_LOOP_GUARD_PERSIST: 1
+	});
+	const s = h.plain('b2-root');
+	// 错误事件里没有工具名、callId 也没登记过 → 认不出报错工具名，只能全局拦
+	h.toolFail(s, { callId: 'u1', reason: 'boom one' });
+	const d1 = await h.call(s, 'read', { file_path: 'r1.txt' });
+	const d2 = await h.call(s, 'write', { file_path: 'w1.txt' });
+	const d3 = await h.call(s, 'read', { file_path: 'r2.txt' });
+	check('B2 认不出报错工具名时是全局拦：工具 A、B 都被这个门拦', [d1, d2, d3].every((v) => isDeny(v, 'LOOP_GUARD_SAME_ERROR')), seqBrief([d1, d2, d3]));
+	const after = [await h.call(s, 'write', { file_path: 'w2.txt' }), await h.call(s, 'read', { file_path: 'r3.txt' })];
+	check('B2 连拦 3 次（DSH_LOOP_GUARD_SAME_ERROR_UNKNOWN_LIMIT 默认 3）后只让这一分支失效：A、B 都不再被这一支拦', after.every(allowed), seqBrief(after));
+	check('B2 降级时吼一声（不静默松开）', h.warned('受限降级'), '');
+	// 另一条分支照常：一旦认出了具体的报错工具名，对它的同错误拦截仍然生效
+	h.toolCall(s, 'read', 'c9');
+	h.toolFail(s, { name: 'read', callId: 'c9', reason: 'boom two' });
+	const readBlocked = await h.call(s, 'read', { file_path: 'r4.txt' });
+	const writeOk = await h.call(s, 'write', { file_path: 'w3.txt' });
+	check('B2 认出工具名后：read 这条分支恢复拦截', isDeny(readBlocked, 'LOOP_GUARD_SAME_ERROR'), brief(readBlocked));
+	check('B2 同一次里另一条分支照常（write 不被这个门拦）', allowed(writeOk), brief(writeOk));
+	h.disposed(s);
+	const stateText = fs.existsSync(STATE_PATH) ? fs.readFileSync(STATE_PATH, 'utf8') : '';
+	check('B2 降级不落盘（重启即恢复）：存档里没有任何降级标记', stateText.includes('"version"') && !stateText.includes('degraded') && !stateText.includes('unknownTool'), '');
+}
+
+// ══════════ 31. B1 同骨架逃生分键 + E10 单槽豁免（重复类门） ══════════
+{
+	const h = harness({
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 1,
+		DSH_LOOP_GUARD_MAX_DENIALS: 1,
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_CYCLE_LIMIT: 99
+	});
+	const s = h.plain('b1-root');
+	await h.call(s, 'read', { file_path: 'a-one.txt' });
+	const aDeny = await h.call(s, 'read', { file_path: 'a-one.txt' });
+	check('B1 骨架 A 到线：被拦', isDeny(aDeny, 'LOOP_GUARD_SKELETON'), brief(aDeny));
+	await h.call(s, 'read', { file_path: 'b-one.txt' });
+	const bDeny = await h.call(s, 'read', { file_path: 'b-one.txt' });
+	check('B1 全新骨架 B 第一次到线仍被拦（逃生计数按骨架分键，不再共用固定键）', isDeny(bDeny, 'LOOP_GUARD_SKELETON'), brief(bDeny));
+	check('B1 分键的证据：两次拒绝各报各的骨架', String(aDeny.reason).includes('a-one.txt') && String(bDeny.reason).includes('b-one.txt'), `${brief(aDeny)} / ${brief(bDeny)}`);
+	const aEscape = await h.call(s, 'read', { file_path: 'a-one.txt' });
+	check('B1 骨架 A 连拦到上限后放行一次（保险丝）', allowed(aEscape), brief(aEscape));
+	const slot = await h.call(s, 'read', { file_path: 'a-one.txt' });
+	check('E10 放行那一次紧接着的同签名一次仍放行（单槽 escapeSig）', allowed(slot), brief(slot));
+	const afterSlot = await h.call(s, 'read', { file_path: 'a-one.txt' });
+	check('E10 单槽只用一次：再下一次照样被拦', isDeny(afterSlot, 'LOOP_GUARD_SKELETON'), brief(afterSlot));
+}
+
+// ══════════ 32. E10 outlier 门：放行后紧接着发同签名必须放行 ══════════
+{
+	const h = harness({
+		DSH_LOOP_GUARD_OUTLIER_RATIO: 5,
+		DSH_LOOP_GUARD_OUTLIER_MIN_SIBLINGS: 3,
+		DSH_LOOP_GUARD_OUTLIER_FLOOR_TOKENS: 1000,
+		DSH_LOOP_GUARD_MAX_DENIALS: 3,
+		DSH_LOOP_GUARD_MAX_SUBAGENT_REQUESTS: 9999,
+		DSH_LOOP_GUARD_MAX_SUBAGENT_TOOLS: 9999,
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 99,
+		DSH_LOOP_GUARD_CYCLE_LIMIT: 99
+	});
+	for (const id of ['e10-s1', 'e10-s2', 'e10-s3']) {
+		const sib = h.sub(id, 'e10-root');
+		h.created(sib);
+		h.charge(sib, 1_000_000, 1);
+	}
+	const odd = h.sub('e10-odd', 'e10-root');
+	h.created(odd);
+	h.charge(odd, 10_000_000, 1);
+	const seq = [];
+	for (let i = 0; i < 4; i += 1) seq.push(await h.call(odd, 'read', { file_path: 'z.txt' }));
+	check('E10 前置：outlier 门连拦到 maxDenials 后放行一次', seq.slice(0, 3).every((v) => isDeny(v, 'LOOP_GUARD_OUTLIER')) && allowed(seq[3]), seqBrief(seq));
+	const resend = await h.call(odd, 'read', { file_path: 'z.txt' });
+	check('E10 outlier 门放行后紧接着发同签名：必须放行（单槽 escapeSig）', allowed(resend), brief(resend));
+	const later = await h.call(odd, 'read', { file_path: 'z.txt' });
+	check('E10 再下一次仍被拦（单槽只用一次）', isDeny(later, 'LOOP_GUARD_OUTLIER'), brief(later));
+}
+
+// ══════════ 33. G6 每轮自比异常：只写 warn，不产生 deny ══════════
+{
+	const h = harness({
+		DSH_LOOP_GUARD_OUTLIER_RATIO: 5,
+		DSH_LOOP_GUARD_OUTLIER_FLOOR_TOKENS: 1000,
+		DSH_LOOP_GUARD_OUTLIER_MIN_SIBLINGS: 3
+	});
+	const odd = h.sub('g6-odd', 'g6-root');
+	h.created(odd);
+	h.charge(odd, 1_000_000, 1);
+	h.charge(odd, 10_000_000, 2);
+	check('G6 本轮计费输入远超本会话已结束轮次中位数：写一条 warn', h.warned('只告警不拦截'), h.logs.map(([, text]) => text).join(' | ').slice(0, 240));
+	check('G6 这条 warn 点明是「和中位数比」而不是别的原因', h.warned('中位数'), '');
+	check('G6 只告警一次（不是每轮刷屏）', h.logs.filter(([, text]) => text.includes('只告警不拦截')).length === 1, String(h.logs.filter(([, text]) => text.includes('只告警不拦截')).length));
+	const verdict = await h.call(odd, 'read', { file_path: 'q.txt' });
+	check('G6 不产生任何 deny：随后那次工具调用照常放行', allowed(verdict), brief(verdict));
+	check('G6 也没有误触发子代理 outlier 门（这个子代理没有兄弟）', !h.logs.some(([level, text]) => level === 'warn' && text.includes('单次请求花得')), '');
+}
+
+// ══════════ 34. 存档 v0 / v1 努力迁移（不许整份丢弃）+ A3 退休表上限 ══════════
+{
+	// ① v0：只有已知字段，也要按已知字段迁移
+	fs.writeFileSync(STATE_PATH, JSON.stringify({ version: 0, sessions: { 'g34-v0': { totalInput: 950_000_000, turn: 1 } } }), 'utf8');
+	const h0 = harness({ DSH_LOOP_GUARD_PERSIST: 1 });
+	check('v0 老存档：打一条「版本不一致 → 按已知字段尽力迁移」的 warn', h0.warned('不一致'), h0.logs.map(([, text]) => text).join(' | ').slice(0, 160));
+	const s0 = h0.plain('g34-v0');
+	const v0Call = await h0.call(s0, 'read', { file_path: 'v0.txt' });
+	check('v0 老存档的 9.5 亿没被丢弃（不到 10 亿时照常放行）', allowed(v0Call), brief(v0Call));
+	h0.charge(s0, 90_000_000, 2);
+	const v0Over = await h0.call(s0, 'read', { file_path: 'v0b.txt' });
+	check('v0 老存档累加到 10.4 亿 → 会话预算照常拦', isDeny(v0Over, 'LOOP_GUARD_SESSION_BUDGET'), brief(v0Over));
+
+	// ② v1：多一个 v2 才有的 turnInput，也不能丢
+	fs.writeFileSync(
+		STATE_PATH,
+		JSON.stringify({
+			version: 1,
+			savedAt: 'x',
+			retired: ['g34-old-retired'],
+			sessions: { 'g34-v1': { totalInput: 950_000_000, turnInput: 5_000_000, turn: 1 } },
+			stats: { sessions: 1, denied: 1, released: 0, exempted: 0, updatedAt: 'x' }
+		}),
+		'utf8'
+	);
+	const registered = [];
+	const webServer = { register(spec) { registered.push(spec); return () => undefined; } };
+	const h1 = harness({ DSH_LOOP_GUARD_PERSIST: 1 }, { webServer });
+	check('v1 老存档：同样按已知字段迁移（有 warn）', h1.warned('不一致'), '');
+	const usage = await httpGet(registered[0].handler, '/api/loop-guard/usage?sessionId=g34-v1');
+	check('v1 老存档：turnInput 也迁移过来了（5 百万）', usage.body?.turn?.input === 5_000_000, JSON.stringify(usage.body?.turn));
+
+	// ③ A3：退休表超过 RETIRED_CAP(2000) 时按插入顺序淘汰最旧一条，而不是整体清空
+	const full = Array.from({ length: 2000 }, (_, index) => `g34-retired-${index}`);
+	fs.writeFileSync(
+		STATE_PATH,
+		JSON.stringify({ version: 2, savedAt: 'x', retired: full, sessions: {}, stats: { sessions: 0, denied: 0, released: 0, exempted: 0, updatedAt: 'x' } }),
+		'utf8'
+	);
+	const h2 = harness({ DSH_LOOP_GUARD_PERSIST: 1 });
+	const extra = h2.plain('g34-extra');
+	h2.created(extra);
+	h2.disposed(extra);
+	const saved = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+	check('A3 退休表上限：长度正好是 2000（不是整体清空）', Array.isArray(saved.retired) && saved.retired.length === 2000, `len=${saved.retired?.length}`);
+	check(
+		'A3 按插入顺序淘汰最旧一条（第 0 条走了，最后一条还在）',
+		!saved.retired.includes('g34-retired-0') && saved.retired.includes('g34-retired-1999'),
+		JSON.stringify(saved.retired.slice(0, 3))
+	);
+	check('A3 新退休的 id 进了表（退休会话不许复活成全新会话）', saved.retired.includes('g34-extra'), '');
+	fs.rmSync(STATE_PATH, { force: true });
+}
+
+// ══════════ 35. 消耗估算（cacheReadInput / uncachedInput / costCny / lastModel） ══════════
+//
+// 契约（冻结，实现必须与此一致；实测不符就报，不许改断言将就）：
+//   cost += cacheRead*cacheHit + (input+cacheWrite)*inputMiss + output*output   （CNY / 百万 token）
+//   价目表 FLASH 平 0.02/1.0/4.0、峰 0.04/2.0/8.0；PRO 平 0.15/4.5/13.5、峰 0.30/9.0/27.0
+//   峰窗口 = 北京时间周一至周五 09:00-12:00 与 14:00-18:00，其余时刻平价，不处理节假日
+//   模型归属 request/header → data.header.config.{provider,model}；request/context → data.{provider,model}
+//   名字含 pro（不区分大小写）走 PRO 表，其余（含压根没收到模型 event）回落 FLASH
+//   只存裸模型名：不加 provider 前缀，大小写原样；provider 仅在模型名缺失时兜底。state 的 lastModel 与 payload 的 cost.model 都是它
+//   折叠规则：模型名含 pro 且样本时刻 < Date.UTC(2026,8,14,4,0) 才走 PRO 行；该时刻及之后 v4-pro 并入 FLASH 计价
+//   端点 payload 的 cost 段：{ cny, estimated: true, model, cacheReadInput, uncachedInput, output, pricesAsOf: '2026-10' }
+{
+	// 期望值全部照契约上的价目表自己算 —— 不从实现里读回来，读回来就等于没测。
+	const FLASH = { hit: [0.02, 0.04], miss: [1.0, 2.0], out: [4.0, 8.0] };
+	const PRO = { hit: [0.15, 0.3], miss: [4.5, 9.0], out: [13.5, 27.0] };
+	const OFF = 0;
+	const PEAK = 1;
+	const million = (tokens, price) => (tokens * price) / 1_000_000;
+	const near = (actual, expected) => typeof actual === 'number' && Math.abs(actual - expected) < 1e-6;
+
+	// 北京时间「第 dayOffset 天（0 = 周一）的 hh:mm」对应的 UTC 毫秒。
+	// 基准：2026-10-05 08:00 北京时间 = 2026-10-05T00:00:00Z，那天是周一（下面第一条断言守着这个前提）。
+	const BJ_MONDAY_0800 = Date.parse('2026-10-05T00:00:00Z');
+	const bjAt = (dayOffset, hour, minute) => BJ_MONDAY_0800 + ((dayOffset * 24 + hour - 8) * 60 + minute) * 60_000;
+	// 折叠点（2026-09-14T04:00:00Z = 北京时间 2026-09-14 12:00）之前才走 PRO 行，
+	// PRO 价的用例要落在它之前：2026-09-07 也是周一（基准日往前 28 天），同一个 bjAt 传负偏移即可。
+	const bjEarly = (dayOffset, hour, minute) => bjAt(dayOffset - 28, hour, minute);
+
+	// 峰/平是按「每笔 usage 样本的到达时刻」选的，而契约里没有注入时钟的 env ——
+	// 只能把进程看到的「现在」钉成一个确定的瞬间（Date.now 与 new Date() 一起换）。
+	const withNow = async (instant, fn) => {
+		const RealDate = Date;
+		class FixedDate extends RealDate {
+			constructor(...args) {
+				if (args.length === 0) super(instant);
+				else super(...args);
+			}
+			static now() {
+				return instant;
+			}
+		}
+		globalThis.Date = FixedDate;
+		try {
+			return await fn();
+		} finally {
+			globalThis.Date = RealDate;
+		}
+	};
+	check(
+		'测试基准日 2026-10-05 是周一（全部峰窗口断言都建在它上面）',
+		new Date(BJ_MONDAY_0800).getUTCDay() === 1,
+		new Date(BJ_MONDAY_0800).toUTCString()
+	);
+
+	const registered = [];
+	const webServer = {
+		register(spec) {
+			registered.push(spec);
+			return () => undefined;
+		}
+	};
+	const costEnv = ['DSH_LOOP_GUARD_COST', 'DSH_LOOP_GUARD_PRICE_TABLE'];
+	/**
+	 * harness() 会在 apply() 之后把 KEYS 里的 env 删掉（那条约定是给「apply 时才读」的配置用的）。
+	 * 消耗估算这两个 env 我按「真正读到它的时候还在」写，所以 apply 之后再钉一次 —— 两种读法都覆盖得住。
+	 */
+	const costHarness = (env = {}) => {
+		const h = harness(env, { webServer });
+		for (const key of costEnv) {
+			if (env[key] === undefined) delete process.env[key];
+			else process.env[key] = String(env[key]);
+		}
+		return h;
+	};
+	/** 一笔 usage 样本：三项可以只给其中任意几项。 */
+	const sample = (h, session, usage, turn = 1) =>
+		h.event(session, {
+			type: 'assistant/chunk',
+			data: {
+				turn,
+				step: 1,
+				chunk: {
+					type: 'usage',
+					usage: { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, ...usage }
+				}
+			}
+		});
+	/** 让插件认出这一轮的模型：两种 event 形状都要能用。 */
+	const seeModel = (h, session, model, via = 'header') =>
+		h.event(
+			session,
+			via === 'header'
+				? { type: 'request/header', data: { header: { config: { provider: 'deepseek', model } } } }
+				: { type: 'request/context', data: { provider: 'deepseek', model } }
+		);
+	/** 读端点：用最后一次 apply 注册的 handler（cfg 是 apply 时的快照，COST=0 那一段必须看它）。 */
+	const bodyOf = async (sessionId) => {
+		const spec = registered[registered.length - 1];
+		const res = await httpGet(spec.handler, `/api/loop-guard/usage?sessionId=${encodeURIComponent(sessionId)}`);
+		return res.body ?? {};
+	};
+	const hasCostShape = (cost) =>
+		cost !== null &&
+		typeof cost === 'object' &&
+		typeof cost.cny === 'number' &&
+		cost.estimated === true &&
+		typeof cost.model === 'string' &&
+		typeof cost.cacheReadInput === 'number' &&
+		typeof cost.uncachedInput === 'number' &&
+		typeof cost.output === 'number' &&
+		cost.pricesAsOf === '2026-10';
+
+	// ① 三项各自计价（平价组）+ 三个计费基各自累加 + payload 形状
+	{
+		const h = costHarness();
+		const s = h.plain('cost-flash-off');
+		seeModel(h, s, 'deepseek-v4-flash');
+
+		await withNow(bjAt(0, 8, 59), () => sample(h, s, { cacheReadTokens: 1_000_000 }));
+		const step1 = (await bodyOf('cost-flash-off')).cost;
+		check('平价 · 只算 cacheRead：1 百万 × 0.02 = 0.02', near(step1?.cny, million(1_000_000, FLASH.hit[OFF])), JSON.stringify(step1));
+		check('payload 的 cost 段形状：七个约定的键都在、类型对', hasCostShape(step1), JSON.stringify(step1));
+		// 契约钉死了这一列的格式：裸模型名（不加 provider 前缀）。这里连「含 /」一起钉。
+		check(
+			'cost.model 是裸模型名：非空、不含 "/"、大小写原样保留',
+			typeof step1?.model === 'string' && step1.model !== '' && !step1.model.includes('/') && step1.model.includes('deepseek-v4-flash'),
+			JSON.stringify(step1?.model)
+		);
+
+		await withNow(bjAt(0, 8, 59), () => sample(h, s, { inputTokens: 1_000_000 }));
+		const step2 = (await bodyOf('cost-flash-off')).cost;
+		check('平价 · 再加 input：0.02 + 1 百万 × 1.0 = 1.02', near(step2?.cny, 1.02), JSON.stringify(step2));
+
+		await withNow(bjAt(0, 8, 59), () => sample(h, s, { outputTokens: 1_000_000 }));
+		const step3 = (await bodyOf('cost-flash-off')).cost;
+		check('平价 · 再加 output：1.02 + 1 百万 × 4.0 = 5.02', near(step3?.cny, 5.02), JSON.stringify(step3));
+
+		// inputMiss 的基是 input + cacheWrite（契约写作 (input+cacheWrite)）
+		await withNow(bjAt(0, 8, 59), () => sample(h, s, { inputTokens: 1_000_000, cacheWriteTokens: 1_000_000 }));
+		const step4 = (await bodyOf('cost-flash-off')).cost;
+		check('平价 · cacheWrite 与 input 同价：5.02 + 2 百万 × 1.0 = 7.02', near(step4?.cny, 7.02), JSON.stringify(step4));
+		check(
+			'三个计费基各记各的：cacheRead 1 百万 / uncached 3 百万 / output 1 百万',
+			step4?.cacheReadInput === 1_000_000 && step4?.uncachedInput === 3_000_000 && step4?.output === 1_000_000,
+			JSON.stringify(step4)
+		);
+	}
+
+	// ② 三项各自计价（峰时组）：同一个会话、周一 09:00
+	{
+		const h = costHarness();
+		const s = h.plain('cost-flash-peak');
+		seeModel(h, s, 'deepseek-v4-flash');
+
+		await withNow(bjAt(0, 9, 0), () => sample(h, s, { cacheReadTokens: 1_000_000 }));
+		const step1 = (await bodyOf('cost-flash-peak')).cost;
+		check('峰时 · cacheRead：1 百万 × 0.04 = 0.04', near(step1?.cny, million(1_000_000, FLASH.hit[PEAK])), JSON.stringify(step1));
+
+		await withNow(bjAt(0, 9, 0), () => sample(h, s, { inputTokens: 1_000_000 }));
+		const step2 = (await bodyOf('cost-flash-peak')).cost;
+		check('峰时 · 再加 input：0.04 + 1 百万 × 2.0 = 2.04', near(step2?.cny, 2.04), JSON.stringify(step2));
+
+		await withNow(bjAt(0, 9, 0), () => sample(h, s, { outputTokens: 1_000_000 }));
+		const step3 = (await bodyOf('cost-flash-peak')).cost;
+		check('峰时 · 再加 output：2.04 + 1 百万 × 8.0 = 10.04', near(step3?.cny, 10.04), JSON.stringify(step3));
+	}
+
+	// ③ 峰窗口边界：一笔只含 cacheRead 的样本，看它被算成峰价还是平价
+	{
+		const edge = async (sessionId, instant) => {
+			const h = costHarness();
+			const s = h.plain(sessionId);
+			seeModel(h, s, 'deepseek-v4-flash');
+			await withNow(instant, () => sample(h, s, { cacheReadTokens: 1_000_000 }));
+			return (await bodyOf(sessionId)).cost?.cny;
+		};
+		// 只测语义明确的点：12:00 / 18:00 是「窗口终点含不含」的歧义边界，契约没写死，不在这儿赌。
+		const cases = [
+			['周一 09:00（上午窗口起点，含）', bjAt(0, 9, 0), PEAK],
+			['周一 10:00（窗口内）', bjAt(0, 10, 0), PEAK],
+			['周一 14:00（下午窗口起点，含）', bjAt(0, 14, 0), PEAK],
+			['周一 08:59（窗口前）', bjAt(0, 8, 59), OFF],
+			['周一 13:00（午休）', bjAt(0, 13, 0), OFF],
+			['周六 10:00（周末）', bjAt(5, 10, 0), OFF],
+			['周日 10:00（周末）', bjAt(6, 10, 0), OFF]
+		];
+		let edgeIndex = 0;
+		for (const [label, instant, column] of cases) {
+			// 会话 id 必须逐个手写：早先是拿 label 拼 id，几个中文标签被 replace 成同一串，
+			// 后一个案例接着前一个的账累加（周六/周日实测 0.06/0.08 的假红就是这么来的）。
+			const cny = await edge(`cost-edge-${edgeIndex++}`, instant);
+			check(`峰窗口边界 · ${label} → ${column === PEAK ? '峰价' : '平价'}`, near(cny, million(1_000_000, FLASH.hit[column])), `${cny}`);
+		}
+	}
+
+	// ④ 模型归属：两种 event 形状 + 名字含 pro（不区分大小写）+ 未知模型回落 FLASH
+	{
+		const sessionCost = async (sessionId, setup, instant = bjAt(0, 8, 59)) => {
+			const h = costHarness();
+			const s = h.plain(sessionId);
+			if (setup !== undefined) setup(h, s);
+			await withNow(instant, () => sample(h, s, { cacheReadTokens: 1_000_000 }));
+			return (await bodyOf(sessionId)).cost;
+		};
+		// pro 行只在折叠点之前有效，所以这两个 case 的时刻要用折叠点之前的（2026-09-07 周一 08:59）。
+		const proUpper = await sessionCost('cost-pro-upper', (h, s) => seeModel(h, s, 'V4-PRO-0528'), bjEarly(0, 8, 59));
+		check('名字含 PRO（大写）也走 PRO 表：1 百万 × 0.15 = 0.15', near(proUpper?.cny, million(1_000_000, PRO.hit[OFF])), JSON.stringify(proUpper));
+		check(
+			'cost.model 里的模型名大小写没被吃掉（V4-PRO-0528 原样在，且是裸名不含 "/"）',
+			typeof proUpper?.model === 'string' && proUpper.model !== '' && !proUpper.model.includes('/') && proUpper.model.includes('V4-PRO-0528'),
+			JSON.stringify(proUpper?.model)
+		);
+
+		const proCtx = await sessionCost('cost-pro-ctx', (h, s) => seeModel(h, s, 'v4-pro', 'context'), bjEarly(0, 8, 59));
+		check('request/context 形状也认模型（data.model 含 pro → PRO 表）', near(proCtx?.cny, million(1_000_000, PRO.hit[OFF])), JSON.stringify(proCtx));
+
+		const flashCtx = await sessionCost('cost-flash-ctx', (h, s) => seeModel(h, s, 'deepseek-v4-flash', 'context'));
+		check('request/context + 非 pro 模型 → FLASH 表：1 百万 × 0.02 = 0.02', near(flashCtx?.cny, million(1_000_000, FLASH.hit[OFF])), JSON.stringify(flashCtx));
+
+		const unknown = await sessionCost('cost-unknown-model', (h, s) => seeModel(h, s, 'mystery-model-9000'));
+		check('未知模型回落 FLASH 表（既不是算不出来、也不是按 PRO 算）', near(unknown?.cny, million(1_000_000, FLASH.hit[OFF])), JSON.stringify(unknown));
+
+		const noModel = await sessionCost('cost-no-model', undefined);
+		check('一次模型 event 都没收到 → 同样回落 FLASH 表', near(noModel?.cny, million(1_000_000, FLASH.hit[OFF])), JSON.stringify(noModel));
+		check(
+			'识别出模型时 cost.model 一律非空且不含 "/"（pro 大写 / pro context / flash context / 未知模型）',
+			[proUpper?.model, proCtx?.model, flashCtx?.model, unknown?.model].every(
+				(value) => typeof value === 'string' && value !== '' && !value.includes('/')
+			),
+			JSON.stringify([proUpper?.model, proCtx?.model, flashCtx?.model, unknown?.model])
+		);
+		check('一次模型 event 都没收到 → cost.model 是空串（不拿 provider 兜底）', noModel?.model === '', JSON.stringify(noModel?.model));
+	}
+
+	// ④b 折叠规则：v4-pro 在 2026-09-14T04:00:00Z（北京时间 2026-09-14 12:00）及之后并入 FLASH 计价
+	{
+		const CUTOFF = Date.UTC(2026, 8, 14, 4, 0);
+		check(
+			'折叠点常量自检：2026-09-14T04:00:00Z 且折叠点前 1 秒是周一（峰窗口断言建在这个前提上）',
+			new Date(CUTOFF).toISOString() === '2026-09-14T04:00:00.000Z' && new Date(CUTOFF - 1_000).getUTCDay() === 1,
+			new Date(CUTOFF - 1_000).toUTCString()
+		);
+		// 峰/平还是按样本时刻选列；这里只换「模型名 + 时刻」两件事，别的一律不动。
+		const at = async (sessionId, instant, model = 'v4-pro') => {
+			const h = costHarness();
+			const s = h.plain(sessionId);
+			seeModel(h, s, model);
+			await withNow(instant, () => sample(h, s, { cacheReadTokens: 1_000_000 }));
+			return (await bodyOf(sessionId)).cost?.cny;
+		};
+		// ① 折叠点之前 1 秒（= 北京 11:59:59 周一，窗口内）→ 仍是 PRO 峰价
+		const beforePeak = await at('cost-fold-before-peak', CUTOFF - 1_000);
+		check('折叠点前 1 秒的 v4-pro 在峰窗口 → PRO 峰价：1 百万 × 0.30 = 0.30', near(beforePeak, million(1_000_000, PRO.hit[PEAK])), `${beforePeak}`);
+		// ① 折叠点之前的平价组（= 北京 08:59:59 周一，窗口外）→ 仍是 PRO 平价
+		const beforeOff = await at('cost-fold-before-off', Date.UTC(2026, 8, 14, 0, 59, 59));
+		check('折叠点前的 v4-pro 在窗口外 → PRO 平价：1 百万 × 0.15 = 0.15', near(beforeOff, million(1_000_000, PRO.hit[OFF])), `${beforeOff}`);
+		// ② 折叠点当刻：北京 12:00 正好是「窗口终点含不含」的契约歧义点，所以这一笔只钉「已不再走 PRO 行」
+		const atCutoff = await at('cost-fold-at-cutoff', CUTOFF);
+		check(
+			'折叠点当刻（2026-09-14T04:00:00Z）的 v4-pro 已并入 FLASH 行：0.02 或 0.04，不再有 PRO 价',
+			[FLASH.hit[OFF], FLASH.hit[PEAK]].some((price) => near(atCutoff, million(1_000_000, price))),
+			`${atCutoff}`
+		);
+		// ② 折叠点之后：北京 12:59:59（窗口外，无歧义）与 2026-10-14T02:00:00Z（北京周三 10:00，窗口内）
+		const afterOff = await at('cost-fold-after-off', Date.UTC(2026, 8, 14, 4, 59, 59));
+		check('折叠点之后的 v4-pro 在窗口外 → FLASH 平价：1 百万 × 0.02 = 0.02', near(afterOff, million(1_000_000, FLASH.hit[OFF])), `${afterOff}`);
+		const afterPeak = await at('cost-fold-after-peak', Date.UTC(2026, 9, 14, 2, 0, 0));
+		check('折叠点之后的 v4-pro 在峰窗口（2026-10-14T02:00:00Z）→ FLASH 峰价：1 百万 × 0.04 = 0.04', near(afterPeak, million(1_000_000, FLASH.hit[PEAK])), `${afterPeak}`);
+		// ③ flash 类模型不受折叠规则影响：同一列（峰窗口内）在折叠点前后同价
+		const flashBefore = await at('cost-fold-flash-before', CUTOFF - 1_000, 'deepseek-v4-flash');
+		const flashAfter = await at('cost-fold-flash-after', Date.UTC(2026, 9, 14, 2, 0, 0), 'deepseek-v4-flash');
+		check(
+			'flash 类模型不受折叠规则影响：折叠点前后同为峰价 0.04（变了就是误伤）',
+			near(flashBefore, million(1_000_000, FLASH.hit[PEAK])) && near(flashAfter, million(1_000_000, FLASH.hit[PEAK])),
+			`${flashBefore} / ${flashAfter}`
+		);
+	}
+
+	// ⑤ DSH_LOOP_GUARD_PRICE_TABLE 覆盖生效（平/峰两列给不同的数，认得出用的是哪一列）
+	{
+		const table = JSON.stringify({
+			default: { cacheHit: [1, 2], inputMiss: [3, 4], output: [5, 6] },
+			pro: { cacheHit: [7, 8], inputMiss: [9, 10], output: [11, 12] }
+		});
+		const full = { cacheReadTokens: 1_000_000, inputTokens: 1_000_000, cacheWriteTokens: 1_000_000, outputTokens: 1_000_000 };
+		const tbl = async (sessionId, instant, model, usage) => {
+			const h = costHarness({ DSH_LOOP_GUARD_PRICE_TABLE: table });
+			const s = h.plain(sessionId);
+			seeModel(h, s, model);
+			await withNow(instant, () => sample(h, s, usage));
+			return (await bodyOf(sessionId)).cost;
+		};
+		const flashOff = await tbl('cost-tbl-flash-off', bjAt(0, 8, 59), 'deepseek-v4-flash', full);
+		check('PRICE_TABLE 覆盖 · 平价 FLASH：1×(1) + 2×(3) + 1×(5) = 12', near(flashOff?.cny, 1 + 2 * 3 + 5), JSON.stringify(flashOff));
+		check(
+			'PRICE_TABLE 覆盖 · 计费基照旧分开记：cacheRead 1 百万 / uncached 2 百万 / output 1 百万',
+			flashOff?.cacheReadInput === 1_000_000 && flashOff?.uncachedInput === 2_000_000 && flashOff?.output === 1_000_000,
+			JSON.stringify(flashOff)
+		);
+		const flashPeak = await tbl('cost-tbl-flash-peak', bjAt(0, 9, 0), 'deepseek-v4-flash', full);
+		check('PRICE_TABLE 覆盖 · 同一笔在峰价列：1×(2) + 2×(4) + 1×(6) = 16', near(flashPeak?.cny, 1 * 2 + 2 * 4 + 6), JSON.stringify(flashPeak));
+		const proOff = await tbl('cost-tbl-pro-off', bjEarly(0, 8, 59), 'v4-pro', { cacheReadTokens: 1_000_000, inputTokens: 1_000_000, outputTokens: 1_000_000 });
+		check('PRICE_TABLE 覆盖 · pro 段独立生效：1×(7) + 1×(9) + 1×(11) = 27', near(proOff?.cny, 7 + 9 + 11), JSON.stringify(proOff));
+		// 折叠规则优先于覆盖表：折叠点之后 v4-pro 只能走 default 行（覆盖表也覆盖不动折叠后的 pro 价）。
+		const proFoldedOff = await tbl('cost-tbl-pro-folded-off', Date.UTC(2026, 8, 14, 4, 59, 59), 'v4-pro', full);
+		const proFoldedPeak = await tbl('cost-tbl-pro-folded-peak', Date.UTC(2026, 9, 14, 2, 0, 0), 'v4-pro', full);
+		check(
+			'PRICE_TABLE 覆盖 · 折叠之后的 v4-pro 不再走 pro 行、改走 default 行：平价 1+2×3+5 = 12 / 峰价 2+2×4+6 = 16',
+			near(proFoldedOff?.cny, 1 + 2 * 3 + 5) && near(proFoldedPeak?.cny, 1 * 2 + 2 * 4 + 6),
+			`${proFoldedOff?.cny} / ${proFoldedPeak?.cny}`
+		);
+	}
+
+	// ⑥ 非法 PRICE_TABLE：只 warn 一条，然后回落内置表（不许崩、不许把闸门带下去）
+	{
+		const h = costHarness({ DSH_LOOP_GUARD_PRICE_TABLE: '{"default": {"cacheHit": [1,' });
+		const malformed = h.logs.filter(([level, text]) => level === 'warn' && String(text).includes('PRICE_TABLE'));
+		check('非法 PRICE_TABLE 只 warn 一条（不刷屏）', malformed.length === 1, h.logs.map(([, text]) => text).join(' | ').slice(0, 240));
+		check('非法 PRICE_TABLE 之后闸门照常装上（apply 没炸）', h.hasPre === true);
+
+		const s = h.plain('cost-tbl-bad');
+		seeModel(h, s, 'deepseek-v4-flash');
+		await withNow(bjAt(0, 8, 59), () => sample(h, s, { cacheReadTokens: 1_000_000 }));
+		const fallback = (await bodyOf('cost-tbl-bad')).cost;
+		check('非法 PRICE_TABLE → 回落内置表：1 百万 × 0.02 = 0.02', near(fallback?.cny, million(1_000_000, FLASH.hit[OFF])), JSON.stringify(fallback));
+	}
+
+	// ⑦ costCny 只增不减（含一笔全 0 的样本：不涨，但也不许回退）
+	{
+		const h = costHarness();
+		const s = h.plain('cost-monotonic');
+		seeModel(h, s, 'deepseek-v4-flash');
+		const seen = [];
+		const steps = [
+			{ cacheReadTokens: 1_000_000 },
+			{ inputTokens: 1_000_000 },
+			{},
+			{ outputTokens: 1_000_000, cacheReadTokens: 1_000_000 },
+			{ cacheWriteTokens: 1_000_000 }
+		];
+		for (const usage of steps) {
+			await withNow(bjAt(0, 8, 59), () => sample(h, s, usage));
+			seen.push((await bodyOf('cost-monotonic')).cost?.cny);
+		}
+		check(
+			'costCny 只增不减（每一步都 ≥ 上一步，全 0 样本只是不涨）',
+			seen.length === steps.length && seen.every((value, index) => typeof value === 'number' && (index === 0 || value >= seen[index - 1])),
+			JSON.stringify(seen)
+		);
+		check('costCny 真的在涨（最后一步 > 第一步）', seen[seen.length - 1] > seen[0], JSON.stringify(seen));
+	}
+
+	// ⑧ DSH_LOOP_GUARD_COST=0：既不累加、也不上报（payload 里没有 cost 键）
+	{
+		const hOff = costHarness({ DSH_LOOP_GUARD_COST: 0 });
+		const s = hOff.plain('cost-off');
+		check('COST=0 时闸门照常装上（关掉的是账本，不是守卫）', hOff.hasPre === true);
+		seeModel(hOff, s, 'deepseek-v4-flash');
+		// 这一笔要是记了就是 5×0.02 + 5×1.0 + 5×4.0 = 25.1（平价 FLASH）
+		await withNow(bjAt(0, 8, 59), () => sample(hOff, s, { cacheReadTokens: 5_000_000, inputTokens: 5_000_000, outputTokens: 5_000_000 }));
+		const offBody = await bodyOf('cost-off');
+		check('COST=0：端点照常答 ok，但 payload 里没有 cost 键', offBody.ok === true && !('cost' in offBody), JSON.stringify(Object.keys(offBody)));
+
+		const hOn = costHarness();
+		const afterOn = await bodyOf('cost-off');
+		check('COST=0 期间一分钱都没记：打开之后这一笔的账是 0', 'cost' in afterOn && afterOn.cost?.cny === 0, JSON.stringify(afterOn.cost));
+		await withNow(bjAt(0, 8, 59), () => sample(hOn, s, { cacheReadTokens: 1_000_000 }));
+		const small = await bodyOf('cost-off');
+		check(
+			'打开后只记新样本：0 + 1 百万 × 0.02 = 0.02（关闭期间那 25.1 没被补记）',
+			near(small.cost?.cny, million(1_000_000, FLASH.hit[OFF])),
+			JSON.stringify(small.cost)
+		);
+	}
+
+	for (const key of costEnv) delete process.env[key];
+}
+
+// ══════════ 36. 旧账金额补算：本版之前就记过账的会话，用快照只补金额 ══════════
+//
+// 契约（冻结；实测不符就报，不许改断言将就）：
+//   触发点 session/created；条件是 `!retired.has(id) && requests > 0 && costEnabled && cacheReadInput + uncachedInput === 0`
+//   只动 cacheReadInput / uncachedInput / costCny 三项，另把 lastModel 换成快照里最后一个 request 事件的裸模型名
+//   token 七项（totalInput / familyInput / requests / modelCalls / toolCalls / turn / turnInput）逐一不变，也不上卷给祖先
+//   金额按快照里的 usage 事件算；价目表的平／峰列取**补算当刻**（事件自带的时刻只用于 pro→flash 的折叠判断）
+//   幂等（补完拆分不再为 0）、COST=0 不补、退休 id 不补、空快照是空操作不崩、只多一行含计数的 info
+//
+// 「requests > 0 而拆分全 0」的旧账只能来自存档：进程内 charge 一笔必然同时写上拆分
+// （lib/index.js 的 charge 与 accrueCost 共用同一段算术）。所以每个场景都先写一份 v2 存档，
+// 再用 harness({ DSH_LOOP_GUARD_PERSIST: 1 }) 把它读回来 —— 进程内造不出这种账。
+{
+	const million = (tokens, price) => (tokens * price) / 1_000_000;
+	const near = (actual, expected) => typeof actual === 'number' && Math.abs(actual - expected) < 1e-6;
+	// 覆盖表把平／峰两列写成同一个数：金额就与「补算发生在什么时刻」无关。
+	// 只有⑨⑩两组要考「取哪一列 / 模型归属」，那两组用内置表 + 钉住进程时钟。
+	const FLAT = JSON.stringify({
+		default: { cacheHit: [3, 3], inputMiss: [5, 5], output: [7, 7] },
+		pro: { cacheHit: [11, 11], inputMiss: [13, 13], output: [17, 17] }
+	});
+	const BJ_MONDAY_0800 = Date.parse('2026-10-05T00:00:00Z');
+	const bjAt = (dayOffset, hour, minute) => BJ_MONDAY_0800 + ((dayOffset * 24 + hour - 8) * 60 + minute) * 60_000;
+	const bjEarly = (dayOffset, hour, minute) => bjAt(dayOffset - 28, hour, minute);
+	const withNow = async (instant, fn) => {
+		const RealDate = Date;
+		class FixedDate extends RealDate {
+			constructor(...args) {
+				if (args.length === 0) super(instant);
+				else super(...args);
+			}
+			static now() {
+				return instant;
+			}
+		}
+		globalThis.Date = FixedDate;
+		try {
+			return await fn();
+		} finally {
+			globalThis.Date = RealDate;
+		}
+	};
+
+	const registered = [];
+	const webServer = {
+		register(spec) {
+			registered.push(spec);
+			return () => undefined;
+		}
+	};
+	const bodyOf = async (sessionId) => {
+		const spec = registered[registered.length - 1];
+		const res = await httpGet(spec.handler, `/api/loop-guard/usage?sessionId=${encodeURIComponent(sessionId)}`);
+		return res.body ?? {};
+	};
+	/** 端点 payload 里的七个 token / 轮次字段 —— 补算一个都不许碰。 */
+	const TOKEN_KEYS = ['totalInput', 'familyInput', 'requests', 'modelCalls', 'toolCalls', 'turn', 'turnInput'];
+	const tokenSlice = (body) => ({
+		totalInput: body.session?.totalInput,
+		familyInput: body.session?.familyInput,
+		requests: body.session?.requests,
+		modelCalls: body.session?.modelCalls,
+		toolCalls: body.session?.toolCalls,
+		turn: body.session?.turn,
+		turnInput: body.turn?.input
+	});
+	const usageEvent = (usage, turn = 1) => ({
+		type: 'assistant/chunk',
+		data: { turn, step: 1, chunk: { type: 'usage', usage } }
+	});
+	/** 快照里的模型归属事件：header 走 data.header.config，context 走 data 本身。 */
+	const requestEvent = (model, via = 'header') =>
+		via === 'header'
+			? { type: 'request/header', data: { header: { config: { provider: 'deepseek', model } } } }
+			: { type: 'request/context', data: { provider: 'deepseek', model } };
+	const backfillLogs = (h, sessionId) => h.logs.filter(([level, text]) => level === 'info' && text.includes(`旧账补算 会话 ${sessionId}`));
+
+	/** 旧版本写下的账本形状：requests 记过，四个金额字段全 0（实测 session-751ec6e6 就是这个样子）。 */
+	const legacyLedger = (over = {}) => ({
+		totalInput: 77_652_325,
+		familyInput: 0,
+		output: 1_234_567,
+		requests: 6,
+		modelCalls: 6,
+		toolCalls: 3,
+		turn: 4,
+		turnInput: 12_345_678,
+		familyTurnInput: 0,
+		cacheReadInput: 0,
+		uncachedInput: 0,
+		costCny: 0,
+		lastModel: '',
+		...over
+	});
+	const archive = (sessions, retired = []) => ({
+		version: 2,
+		savedAt: '2026-01-01T00:00:00.000Z',
+		retired,
+		sessions,
+		stats: { sessions: Object.keys(sessions).length, denied: 0, released: 1, exempted: 2, updatedAt: '2026-01-01T00:00:00.000Z' }
+	});
+	/** 写一份存档，紧接着 harness(PERSIST=1) 把它读回来 —— 两件事之间没有 await，不会有别的写盘插进来。 */
+	const loadArchive = (sessions, env = {}, retired = [], priceTable = FLAT) => {
+		fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
+		fs.writeFileSync(STATE_PATH, JSON.stringify(archive(sessions, retired)));
+		const vars = { DSH_LOOP_GUARD_PERSIST: 1, ...env };
+		if (priceTable !== null) vars.DSH_LOOP_GUARD_PRICE_TABLE = priceTable;
+		return harness(vars, { webServer });
+	};
+
+	// ① 旧账补算：算术自己手算（不从实现里读回来），只补金额三项 + lastModel + 一行 info
+	{
+		const h = loadArchive({ 'lg-legacy': legacyLedger() });
+		const before = await bodyOf('lg-legacy');
+		check(
+			'① 旧账读得回来：payload 是存档原值（requests=6 / turnInput=12_345_678 / 三个金额字段全 0）',
+			before.session?.requests === 6 &&
+				before.turn?.input === 12_345_678 &&
+				before.cost?.cacheReadInput === 0 &&
+				before.cost?.uncachedInput === 0 &&
+				before.cost?.cny === 0,
+			JSON.stringify(before)
+		);
+		check('① 旧账读得回来 · 存档里的 lastModel 是空的（所以下面的模型名只能来自快照）', before.cost?.model === '', JSON.stringify(before.cost));
+		await h.created({
+			id: 'lg-legacy',
+			snapshotEvents: () => [
+				requestEvent('deepseek-v4-flash'),
+				usageEvent({ inputTokens: 4_000_000, cacheReadTokens: 6_000_000, cacheWriteTokens: 1_000_000, outputTokens: 2_000_000 }),
+				usageEvent({ outputTokens: 500_000 }), // 缺字段按 0：这笔只贡献 output 的价
+				requestEvent('deepseek-v4-pro')
+			]
+		});
+		const after = await bodyOf('lg-legacy');
+		check(
+			'① 旧账补算 · 手算期望：6M×3 + (4M+1M)×5 + 2.5M×7 = 60.5 元（平=峰，与补算时刻无关）',
+			near(after.cost?.cny, 60.5),
+			JSON.stringify(after.cost)
+		);
+		check('① 旧账补算 · cacheReadInput = 6_000_000（快照里两笔 cacheRead 之和）', after.cost?.cacheReadInput === 6_000_000, JSON.stringify(after.cost));
+		check('① 旧账补算 · uncachedInput = inputTokens + cacheWriteTokens = 5_000_000', after.cost?.uncachedInput === 5_000_000, JSON.stringify(after.cost));
+		check('① 旧账补算 · 旧账的 output 一个 token 都没被重算（仍是存档里的 1_234_567）', after.cost?.output === 1_234_567, JSON.stringify(after.cost));
+		check(
+			'① 旧账补算 · lastModel 取快照里最后一个 request 事件的裸模型名（pro，不带 provider）',
+			after.cost?.model === 'deepseek-v4-pro',
+			JSON.stringify(after.cost?.model)
+		);
+		const infos = backfillLogs(h, 'lg-legacy');
+		// logger 那一层会带上 `[loop-guard] ` 前缀，所以只锚两头、中间逐字对齐冻结文案。
+		const frozen = /^(?:\[loop-guard\] )?旧账补算 会话 lg-legacy：历史 4 条 → cacheRead=6000000 uncached=5000000 金额=[\d.]+（只补金额，token 一概未动）$/;
+		check('① 旧账补算 · 恰好一行 info，文案只有计数（没有对话内容）', infos.length === 1 && frozen.test(infos[0][1]), JSON.stringify(infos));
+		check(
+			'① 旧账补算 · 同一行也落进诊断日志文件',
+			fs.existsSync(LOG_PATH) && fs.readFileSync(LOG_PATH, 'utf8').includes('旧账补算 会话 lg-legacy'),
+			fs.existsSync(LOG_PATH) ? fs.readFileSync(LOG_PATH, 'utf8').slice(-300) : '没有日志文件'
+		);
+	}
+
+	// ② token 七项逐一不变：快照里塞满「完整重放会改数」的事件，补算也不许碰它们
+	{
+		const h = loadArchive({ 'lg-invariant': legacyLedger() });
+		const before = tokenSlice(await bodyOf('lg-invariant'));
+		await h.created({
+			id: 'lg-invariant',
+			snapshotEvents: () => [
+				requestEvent('deepseek-v4-flash'),
+				usageEvent({ inputTokens: 9_000_000, outputTokens: 9_000_000 }),
+				// 完整重放里这一条会把 modelCalls 加一：它没把计数改掉，就说明走的是补算不是重放
+				{ type: 'assistant/message', data: {} },
+				{ type: 'tool/call', data: { turn: 1, step: 1, name: 'read', callId: 'c1', arguments: {} } }
+			]
+		});
+		const afterBody = await bodyOf('lg-invariant');
+		const after = tokenSlice(afterBody);
+		for (const key of TOKEN_KEYS) {
+			check(`② 旧账补算 · token 七项逐一不变：${key}`, after[key] === before[key], `${key}: ${before[key]} → ${after[key]}`);
+		}
+		check(
+			'② 旧账补算 · 七项确实还是旧账原值（不是「两边一起变成 0」那种假不变）',
+			after.totalInput === 77_652_325 &&
+				after.familyInput === 0 &&
+				after.requests === 6 &&
+				after.modelCalls === 6 &&
+				after.toolCalls === 3 &&
+				after.turn === 4 &&
+				after.turnInput === 12_345_678,
+			JSON.stringify(after)
+		);
+		check(
+			'② 旧账补算 · 补算真的发生了（否则「不变」是空话）：uncachedInput 被补成 9_000_000',
+			afterBody.cost?.cacheReadInput === 0 && afterBody.cost?.uncachedInput === 9_000_000,
+			JSON.stringify(afterBody.cost)
+		);
+		check(
+			'② 旧账补算 · 跳过了完整重放：快照里的 assistant/message 没把 requests / modelCalls 加一',
+			after.requests === 6 && after.modelCalls === 6,
+			`requests ${before.requests} → ${after.requests}、modelCalls ${before.modelCalls} → ${after.modelCalls}`
+		);
+	}
+
+	// ③ 幂等：同一会话再触发两次，金额与拆分都不许翻倍；顺带守「不上卷给祖先」
+	{
+		const h = loadArchive({
+			'lg-idem': legacyLedger(),
+			'lg-idem-parent': legacyLedger({ totalInput: 0, output: 0, requests: 1, modelCalls: 1, toolCalls: 0, turn: 1, turnInput: 0 })
+		});
+		const session = {
+			id: 'lg-idem',
+			header: { origin: 'subagent', parentSession: 'lg-idem-parent' },
+			snapshotEvents: () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 1_000_000, cacheReadTokens: 2_000_000 })]
+		};
+		await h.created(session);
+		const once = await bodyOf('lg-idem');
+		check('③ 幂等 · 第一遍：2M×3 + 1M×5 = 11 元', near(once.cost?.cny, 11), JSON.stringify(once.cost));
+		await h.created(session);
+		await h.created(session);
+		const thrice = await bodyOf('lg-idem');
+		check('③ 幂等 · 再触发两次金额不翻倍（仍是 11 元，不是 33）', near(thrice.cost?.cny, 11), JSON.stringify(thrice.cost));
+		check(
+			'③ 幂等 · 拆分也不翻倍：cacheReadInput=2_000_000、uncachedInput=1_000_000',
+			thrice.cost?.cacheReadInput === 2_000_000 && thrice.cost?.uncachedInput === 1_000_000,
+			JSON.stringify(thrice.cost)
+		);
+		check('③ 幂等 · 只有第一次留下补算日志（后两次条件已不成立）', backfillLogs(h, 'lg-idem').length === 1, JSON.stringify(backfillLogs(h, 'lg-idem')));
+		const parent = await bodyOf('lg-idem-parent');
+		check('③ 旧账补算 · 不上卷给祖先：父会话 familyInput 仍是 0（补算只动自己那一本账）', parent.session?.familyInput === 0, JSON.stringify(parent.session));
+	}
+
+	// ④ 幂等·续命：补算结果落盘后再重启一次，新的进程不许再补一遍
+	{
+		const h1 = loadArchive({ 'lg-reload': legacyLedger() });
+		await h1.created({
+			id: 'lg-reload',
+			snapshotEvents: () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 3_000_000, cacheReadTokens: 4_000_000 })]
+		});
+		const done = await bodyOf('lg-reload');
+		check('④ 幂等·存盘前：4M×3 + 3M×5 = 27 元', near(done.cost?.cny, 27), JSON.stringify(done.cost));
+		// charge 的写盘有 10 秒节流，而 session/disposed 里那一次 writeState 是无条件的 ——
+		// 所以借 dispose 另一个 id 把内存账本立刻逼到盘上（persist.mjs 的 saveNow 也是这么干的）。
+		// 不能 dispose lg-reload 自己：disposed 会先 ledgers.delete(id) 再 writeState()，
+		// 那样它反而不会出现在存档的 sessions 里（只进 retired 名单）。
+		await h1.disposed({ id: 'lg-flush' });
+		const saved = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+		const written = saved.sessions?.['lg-reload'] ?? {};
+		check(
+			'④ 幂等·补算结果真的落进存档（cacheReadInput=4_000_000 / uncachedInput=3_000_000 / costCny=27 / lastModel=flash）',
+			written.cacheReadInput === 4_000_000 && written.uncachedInput === 3_000_000 && near(written.costCny, 27) && written.lastModel === 'deepseek-v4-flash',
+			JSON.stringify(written)
+		);
+		check(
+			'④ 幂等·被 dispose 的是那个替身 id：lg-flush 进了退休表、lg-reload 没有（它的账本活着才会被写盘）',
+			Array.isArray(saved.retired) && saved.retired.includes('lg-flush') && !saved.retired.includes('lg-reload'),
+			JSON.stringify(saved.retired.slice(-3))
+		);
+		const h2 = harness({ DSH_LOOP_GUARD_PERSIST: 1, DSH_LOOP_GUARD_PRICE_TABLE: FLAT }, { webServer });
+		const beforeReload = tokenSlice(await bodyOf('lg-reload'));
+		await h2.created({
+			id: 'lg-reload',
+			snapshotEvents: () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 3_000_000, cacheReadTokens: 4_000_000 })]
+		});
+		const restart = await bodyOf('lg-reload');
+		check('④ 幂等·存档存读一轮后重启：金额仍是 27 元、没有重复计', near(restart.cost?.cny, 27), JSON.stringify(restart.cost));
+		check('④ 幂等·重启后没有补算日志（cacheReadInput + uncachedInput === 0 不成立）', backfillLogs(h2, 'lg-reload').length === 0, JSON.stringify(h2.logs));
+		check(
+			'④ 幂等·重启后 token 七项仍是存档原值',
+			JSON.stringify(tokenSlice(restart)) === JSON.stringify(beforeReload),
+			`${JSON.stringify(beforeReload)} → ${JSON.stringify(tokenSlice(restart))}`
+		);
+	}
+
+	// ⑤ 拆分已非 0（含「只有 1」的边界）时不许补算，连 lastModel 都不许换
+	{
+		const h = loadArchive({
+			'lg-priced': legacyLedger({ cacheReadInput: 111, uncachedInput: 222, costCny: 0.03, lastModel: 'deepseek-v4-flash' }),
+			'lg-one': legacyLedger({ cacheReadInput: 1, uncachedInput: 0, lastModel: 'deepseek-v4-flash' })
+		});
+		const beforePriced = tokenSlice(await bodyOf('lg-priced'));
+		const big = () => [requestEvent('deepseek-v4-pro'), usageEvent({ inputTokens: 1_000_000, cacheReadTokens: 1_000_000, outputTokens: 1_000_000 })];
+		await h.created({ id: 'lg-priced', snapshotEvents: big });
+		await h.created({ id: 'lg-one', snapshotEvents: big });
+		const priced = await bodyOf('lg-priced');
+		check('⑤ 拆分已非 0 不补算 · 金额原样 0.03（没被补算改掉）', near(priced.cost?.cny, 0.03), JSON.stringify(priced.cost));
+		check('⑤ 拆分已非 0 不补算 · 拆分原样 111 / 222', priced.cost?.cacheReadInput === 111 && priced.cost?.uncachedInput === 222, JSON.stringify(priced.cost));
+		check('⑤ 拆分已非 0 不补算 · 连 lastModel 都没被快照里的 pro 换掉', priced.cost?.model === 'deepseek-v4-flash', JSON.stringify(priced.cost?.model));
+		check('⑤ 拆分已非 0 不补算 · 没有补算日志', backfillLogs(h, 'lg-priced').length === 0, JSON.stringify(h.logs));
+		check(
+			'⑤ 拆分已非 0 不补算 · token 七项也不变',
+			JSON.stringify(tokenSlice(priced)) === JSON.stringify(beforePriced),
+			`${JSON.stringify(beforePriced)} → ${JSON.stringify(tokenSlice(priced))}`
+		);
+		const one = await bodyOf('lg-one');
+		check(
+			'⑤ 边界 · cacheReadInput + uncachedInput = 1 也算「已记过」：拆分仍是 1 / 0',
+			one.cost?.cacheReadInput === 1 && one.cost?.uncachedInput === 0,
+			JSON.stringify(one.cost)
+		);
+		check('⑤ 边界 · 那一笔也没留下补算日志', backfillLogs(h, 'lg-one').length === 0, JSON.stringify(backfillLogs(h, 'lg-one')));
+	}
+
+	// ⑥ COST=0 整个补算不启动；关掉开关时端点连 cost 段都不给，所以拆分去落盘的存档里看
+	{
+		const h = loadArchive({ 'lg-costoff': legacyLedger() }, { DSH_LOOP_GUARD_COST: 0 });
+		const before = tokenSlice(await bodyOf('lg-costoff'));
+		const off = await bodyOf('lg-costoff');
+		check('⑥ COST=0 · 端点连 cost 段都不给（与「花了 0 元」是两件事）', off.cost === undefined, JSON.stringify(Object.keys(off)));
+		await h.created({
+			id: 'lg-costoff',
+			snapshotEvents: () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 5_000_000, cacheReadTokens: 5_000_000, outputTokens: 5_000_000 })]
+		});
+		const after = tokenSlice(await bodyOf('lg-costoff'));
+		check('⑥ COST=0 不补算 · 没有补算日志', backfillLogs(h, 'lg-costoff').length === 0, JSON.stringify(h.logs));
+		check(
+			'⑥ COST=0 不补算 · token 七项一个没动',
+			JSON.stringify(after) === JSON.stringify(before),
+			`${JSON.stringify(before)} → ${JSON.stringify(after)}`
+		);
+		await h.disposed({ id: 'lg-costoff-flush' }); // 同上：借另一个 id 触发无条件写盘
+		const saved = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+		const entry = saved.sessions?.['lg-costoff'] ?? {};
+		check(
+			'⑥ COST=0 不补算 · 落盘的那条也没有金额拆分（缓存读 / 未缓存输入仍是 0）',
+			(entry.cacheReadInput ?? -1) === 0 && (entry.uncachedInput ?? -1) === 0,
+			JSON.stringify(entry)
+		);
+		// 反证：同一份落盘存档（拆分全 0、lg-costoff 自己没退休）拿给打开开关的新装载，必须补出一笔 ——
+		// 上面那次 COST=0 要是偷偷补过，这里读到的拆分就不是 0、门已经关上、不会再补。
+		const h2 = harness({ DSH_LOOP_GUARD_PERSIST: 1, DSH_LOOP_GUARD_COST: 1, DSH_LOOP_GUARD_PRICE_TABLE: FLAT }, { webServer });
+		await h2.created({
+			id: 'lg-costoff',
+			snapshotEvents: () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 5_000_000, cacheReadTokens: 5_000_000, outputTokens: 5_000_000 })]
+		});
+		const on = await bodyOf('lg-costoff');
+		check(
+			'⑥ 反证 · 打开开关后同一份存档补出 5M×3 + 5M×5 + 5M×7 = 75 元（说明 COST=0 那次真的没补）',
+			near(on.cost?.cny, 75) && backfillLogs(h2, 'lg-costoff').length === 1,
+			`${JSON.stringify(on.cost)} / ${JSON.stringify(backfillLogs(h2, 'lg-costoff'))}`
+		);
+	}
+
+	// ⑦ 退休 id 不补算（H1 那套夹具写法：带子代理头 + 一大笔快照）
+	{
+		const h = loadArchive(
+			{
+				'lg-retired': legacyLedger({ totalInput: 0, output: 0, requests: 3, modelCalls: 3, toolCalls: 0, turn: 1, turnInput: 0 }),
+				'lg-retired-parent': legacyLedger({ totalInput: 0, output: 0, requests: 1, modelCalls: 1, toolCalls: 0, turn: 1, turnInput: 0 })
+			},
+			{},
+			['lg-retired']
+		);
+		await h.created({
+			id: 'lg-retired',
+			header: { origin: 'subagent', parentSession: 'lg-retired-parent' },
+			snapshotEvents: () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 400_000_000, cacheReadTokens: 400_000_000, outputTokens: 400_000_000 })]
+		});
+		const self = await bodyOf('lg-retired');
+		check(
+			'⑦ 退休 id 不补算 · 一笔 4 亿 token 的快照都没被算进去（金额与拆分仍是 0）',
+			near(self.cost?.cny, 0) && self.cost?.cacheReadInput === 0 && self.cost?.uncachedInput === 0,
+			JSON.stringify(self.cost)
+		);
+		check('⑦ 退休 id 不补算 · 也没有补算日志', backfillLogs(h, 'lg-retired').length === 0, JSON.stringify(h.logs));
+		const parent = await bodyOf('lg-retired-parent');
+		check('⑦ 退休 id 不补算 · 祖先没被卷进来（familyInput 仍是 0）', parent.session?.familyInput === 0, JSON.stringify(parent.session));
+	}
+
+	// ⑧ 空快照（[] / 宿主没给 snapshotEvents / 返回 undefined）是空操作：不崩、不动字段
+	{
+		const h = loadArchive({ 'lg-empty': legacyLedger(), 'lg-noevents': legacyLedger(), 'lg-undefined': legacyLedger() });
+		const before = {
+			empty: tokenSlice(await bodyOf('lg-empty')),
+			noevents: tokenSlice(await bodyOf('lg-noevents')),
+			undef: tokenSlice(await bodyOf('lg-undefined'))
+		};
+		let threw = '';
+		try {
+			await h.created({ id: 'lg-empty', snapshotEvents: () => [] });
+			await h.created({ id: 'lg-noevents' }); // 宿主压根没给 snapshotEvents
+			await h.created({ id: 'lg-undefined', snapshotEvents: () => undefined });
+		} catch (error) {
+			threw = String(error?.message ?? error);
+		}
+		check('⑧ 空快照不崩 · session/created 没有把异常抛回宿主', threw === '', threw);
+		const empty = await bodyOf('lg-empty');
+		check(
+			'⑧ 空快照不崩 · 空数组快照：金额与拆分仍是 0，token 七项一个字段都没动',
+			near(empty.cost?.cny, 0) &&
+				empty.cost?.cacheReadInput === 0 &&
+				empty.cost?.uncachedInput === 0 &&
+				JSON.stringify(tokenSlice(empty)) === JSON.stringify(before.empty),
+			JSON.stringify({ cost: empty.cost, tokens: tokenSlice(empty) })
+		);
+		check(
+			'⑧ 空快照不崩 · 空快照也照回一行 info（历史 0 条）',
+			backfillLogs(h, 'lg-empty').length === 1 && backfillLogs(h, 'lg-empty')[0][1].includes('历史 0 条'),
+			JSON.stringify(backfillLogs(h, 'lg-empty'))
+		);
+		const noevents = await bodyOf('lg-noevents');
+		check(
+			'⑧ 空快照不崩 · 宿主没给 snapshotEvents 时按空快照处理（字段不动、也回一行 info）',
+			JSON.stringify(tokenSlice(noevents)) === JSON.stringify(before.noevents) && near(noevents.cost?.cny, 0) && backfillLogs(h, 'lg-noevents').length === 1,
+			JSON.stringify({ cost: noevents.cost, tokens: tokenSlice(noevents) })
+		);
+		const undef = await bodyOf('lg-undefined');
+		check(
+			'⑧ 空快照不崩 · snapshotEvents() 返回 undefined 也当空快照',
+			JSON.stringify(tokenSlice(undef)) === JSON.stringify(before.undef) && near(undef.cost?.cny, 0),
+			JSON.stringify({ cost: undef.cost, tokens: tokenSlice(undef) })
+		);
+	}
+
+	// ⑨ 平/峰列取「补算当刻」而不是事件时刻：同一份快照换个补算时刻就该换个价
+	{
+		const snapshotEvents = () => [requestEvent('deepseek-v4-flash'), usageEvent({ inputTokens: 1_000_000, cacheReadTokens: 1_000_000, outputTokens: 1_000_000 })];
+		const h = loadArchive({ 'lg-column-off': legacyLedger() }, {}, [], null); // null = 用内置价目表
+		await withNow(bjAt(0, 8, 30), () => h.created({ id: 'lg-column-off', snapshotEvents })); // 周一 08:30 北京 = 平价窗口
+		const off = await bodyOf('lg-column-off');
+		check('⑨ 价列取补算当刻 · 周一 08:30 补算 → 平价：0.02 + 1 + 4 = 5.02 元', near(off.cost?.cny, 5.02), JSON.stringify(off.cost));
+		const h2 = loadArchive({ 'lg-column-peak': legacyLedger() }, {}, [], null);
+		await withNow(bjAt(0, 11, 0), () => h2.created({ id: 'lg-column-peak', snapshotEvents })); // 周一 11:00 北京 = 峰窗口
+		const peak = await bodyOf('lg-column-peak');
+		check('⑨ 价列取补算当刻 · 同一份快照在周一 11:00 补算 → 峰价：0.04 + 2 + 8 = 10.04 元', near(peak.cost?.cny, 10.04), JSON.stringify(peak.cost));
+		check(
+			'⑨ 价列取补算当刻 · 两次补算同一份快照金额不同 ⇒ 看的是补算时刻',
+			near(off.cost?.cny, 5.02) && near(peak.cost?.cny, 10.04),
+			`平价 ${off.cost?.cny} / 峰价 ${peak.cost?.cny}`
+		);
+	}
+
+	// ⑩ 模型归属来自快照：request/context 能把后面的样本从 flash 行切到 pro 行
+	{
+		// 折叠点（2026-09-14T04:00:00Z）之前 pro 才走 pro 行，所以时钟钉在前一周的周一 08:30（平价窗口）。
+		const at = bjEarly(0, 8, 30);
+		const h = loadArchive({ 'lg-context': legacyLedger() }, {}, [], null);
+		await withNow(at, () =>
+			h.created({
+				id: 'lg-context',
+				snapshotEvents: () => [
+					requestEvent('deepseek-v4-flash'),
+					usageEvent({ cacheReadTokens: 1_000_000 }),
+					requestEvent('deepseek-v4-pro', 'context'),
+					usageEvent({ cacheReadTokens: 1_000_000 })
+				]
+			})
+		);
+		const body = await bodyOf('lg-context');
+		check(
+			'⑩ 模型归属来自快照 · request/context 把后一笔从 flash 切到 pro：1M×0.02 + 1M×0.15 = 0.17 元',
+			near(body.cost?.cny, 0.17),
+			JSON.stringify(body.cost)
+		);
+		check('⑩ 模型归属来自快照 · lastModel 是快照里最后一个 request 事件的裸模型名（pro）', body.cost?.model === 'deepseek-v4-pro', JSON.stringify(body.cost?.model));
+		const h2 = loadArchive({ 'lg-context-flash': legacyLedger() }, {}, [], null);
+		await withNow(at, () =>
+			h2.created({
+				id: 'lg-context-flash',
+				snapshotEvents: () => [
+					requestEvent('deepseek-v4-flash'),
+					usageEvent({ cacheReadTokens: 1_000_000 }),
+					requestEvent('deepseek-v4-flash', 'context'),
+					usageEvent({ cacheReadTokens: 1_000_000 })
+				]
+			})
+		);
+		const flatBody = await bodyOf('lg-context-flash');
+		check('⑩ 模型归属来自快照 · 反证：两条 request 都说 flash 时只有 1M×0.02 ×2 = 0.04 元', near(flatBody.cost?.cny, 0.04), JSON.stringify(flatBody.cost));
+	}
+}
+
+// ══════════ 37. 日志安全化：控制字符绝不落盘 ══════════
+//
+// 真实事故：内部错误指纹是 `工具名\u0000错误正文`，同一个错误门的 warn 原来把指纹原样
+// 拼进日志行，于是真日志 ~/.dsh/loop-guard.log 里出现 U+0000（实测 4 处）—— 整份日志
+// 被 grep / tail 判成二进制文件，从此读不出来。
+//
+// 两层修，两层各要一条断言：① lib/index.js:1847 的 fingerprintParts 在展示前拆开指纹
+// （U+0000 只是分隔符，不该糊在正文里）；② lib/index.js:540-552 的 LOG_UNSAFE_RE /
+// logSafe 在 fileLog 落盘前兜底（C0 与 DEL → `·`，保留 \t 与 \n）。只测其中一层，
+// 另一层被改掉时日志会重新变成二进制文件。
+{
+	// 落盘要显式打开（默认 NO_PERSIST=1 时 fileLog 直接返回，见文件头），日志路径是
+	// test/.guards-log.log（import 之前就指好了）。按**行号**切出「本场景新增的那一段」：
+	// 前面 36 节已经写过若干行，不切的话断言可能被旧行满足（`·` 这种短串尤其危险）。
+	const logLineCount = () => (fs.existsSync(LOG_PATH) ? fs.readFileSync(LOG_PATH, 'utf8').split('\n').length : 0);
+	const logSince = (before) => (fs.existsSync(LOG_PATH) ? fs.readFileSync(LOG_PATH, 'utf8').split('\n').slice(before - 1).join('\n') : '');
+	/** 断言失败时要看的那一小段，别把整份日志倒进测试输出。 */
+	const snippet = (text) => JSON.stringify(String(text).slice(-140));
+
+	const h = harness({
+		DSH_LOOP_GUARD_PERSIST: 1,
+		DSH_LOOP_GUARD_SAME_ERROR_LIMIT: 1,
+		DSH_LOOP_GUARD_MAX_DENIALS: 9,
+		DSH_LOOP_GUARD_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_READ_REPEAT_LIMIT: 99,
+		DSH_LOOP_GUARD_SKELETON_LIMIT: 9999,
+		DSH_LOOP_GUARD_CYCLE_LIMIT: 9999
+	});
+
+	// 37.1 正文里自带 U+0000 的报错 → 真实的同错误门 → warn → fileLog
+	let mark = logLineCount();
+	const s = h.plain('g37-nul');
+	h.toolFail(s, { name: 'edit', callId: 'c37', reason: 'Error: EPERM\u0000kept-going' });
+	const tripped = await h.call(s, 'edit', { file_path: 'g37-a.txt' });
+	check('37.1 带 NUL 的同一个错误门真的触发（否则下面的落盘断言是空转）', isDeny(tripped, 'LOOP_GUARD_SAME_ERROR'), brief(tripped));
+	check('37.1 宿主日志里已经是「拦：edit — 正文」而不是指纹原文', h.warned('拦：edit \u2014 Error: EPERM'), '');
+	check('37.1 第①层 fingerprintParts：连宿主日志里都没有 `edit\\u0000Error` 这个指纹形状', !h.logs.some(([, text]) => text.includes('edit\u0000Error')), '');
+	const added = logSince(mark);
+	check('37.1 这一段真的落进了诊断日志', added.includes('同一个错误已出现'), snippet(added));
+	check('37.1 落盘后 0 个 U+0000（有 NUL 就会被 grep / tail 判成二进制）', !added.includes('\u0000'), snippet(added));
+	check('37.1 第②层 logSafe：正文里的 NUL 换成 ·（替换而不是删除）', added.includes('Error: EPERM\u00b7kept-going'), snippet(added));
+	check('37.1 展示形式：工具名 +「 — 」+ 正文都在同一行', added.includes('拦：edit \u2014 Error: EPERM\u00b7kept-going'), snippet(added));
+	check('37.1 不是指纹原文形状 `edit\\u0000Error`', !added.includes('edit\u0000Error'), snippet(added));
+
+	// 37.2 \t 与 \n 必须保留（「替换而不是删除」只针对别的控制字符）。logSafe 没有导出，
+	// 所以走间接路线：把 \t / \n 放进**会话 id** —— 它被原样拼进每一条 warn 行，
+	// 正好是「消息里带 \t / \n」最干净的入口。
+	mark = logLineCount();
+	const t = h.plain('g37-tab\tmid\nend');
+	h.toolFail(t, { name: 'edit', callId: 'c37t', reason: 'Error: ETXTBSY blob locked' });
+	const tabbed = await h.call(t, 'edit', { file_path: 'g37-b.txt' });
+	check('37.2 制表 / 换行这一场也真的触发了这条 warn', isDeny(tabbed, 'LOOP_GUARD_SAME_ERROR'), brief(tabbed));
+	const added2 = logSince(mark);
+	check('37.2 落盘后 \\t 与 \\n 原样保留（没被换成 ·）', added2.includes('g37-tab\tmid\nend'), snippet(added2));
+	check('37.2 \\t / \\n 没被当成不安全字符（那一段里不该出现 g37-tab·）', !added2.includes('g37-tab\u00b7'), '');
+
+	// 37.3 指纹里工具名为空（认不出报错工具名）：原样只输出正文，不拼一个空工具名 +「 — 」。
+	//     （fingerprintParts 里 `cut === -1`（整串都算正文）那条分支只能从旧存档喂进来，
+	//     本文件不覆盖 —— 这里的指纹一定带分隔符。）
+	mark = logLineCount();
+	const u = h.plain('g37-unknown');
+	h.toolFail(u, { callId: 'c37u', reason: 'Error: EIO\u0000bare-body' });
+	const unknown = await h.call(u, 'read', { file_path: 'g37-c.txt' });
+	check('37.3 认不出工具名时这一支照常拦（否则断言空转）', isDeny(unknown, 'LOOP_GUARD_SAME_ERROR'), brief(unknown));
+	const added3 = logSince(mark);
+	check('37.3 没有工具名就不拼「 — 」：正文原样接在「拦：」后面', added3.includes('拦：Error: EIO\u00b7bare-body') && !added3.includes('拦：\u2014') && !added3.includes('拦： \u2014'), snippet(added3));
+	check('37.3 这一条里同样 0 个 U+0000', !added3.includes('\u0000'), '');
+
+	// 整份测试日志的终检：三场写完之后文件里一个 NUL 都不该有 ——
+	// 这正是真实事故的判据（有 NUL，grep / tail 就把整份日志当二进制）。
+	const wholeLog = fs.existsSync(LOG_PATH) ? fs.readFileSync(LOG_PATH, 'utf8') : '';
+	check('37 整份测试日志 0 个 U+0000（不是只看新增那一段）', !wholeLog.includes('\u0000'), `共 ${wholeLog.split('\n').length} 行`);
+}
+
+// ══════════ 38. 崩溃/重启后同一会话接着算（H2：注销时不丢账） ══════════
+//
+// 真实事故：宿主崩溃 / 重启会把**在跑的会话逐个** session/disposed。旧实现是
+// 「ledgers.delete(id) → retired.add(id) → writeState()」—— 那些会话的计数于是从存档里
+// 消失，重启后同一个 id 复活又被 retired 挡住、不许重放历史，于是计数从零重数
+// （真机实测：崩溃前累计计费输入 2485.7 万 token，重启后存档只剩 260 万 / 13 次请求）。
+//
+// 新口径：已注销的账本留在存档的 disposed 里（FIFO，上限 DISPOSED_CAP = 200），同一个 id
+// 复活时把这些计数直接接回账本 —— 不重放历史、也不给祖先重复上卷。本节钉住六件事：
+//   ① 注销时落盘：快照的 13 个字段与注销前的账本逐一相等；
+//   ② 复活时用掉它：同一份存档里不再同时留两份账（sessions 里活着、disposed 里没有）；
+//   ③ 上限 FIFO：第 201 条进来时淘汰的是最旧那条，最新的还在；
+//   ④ 老行为回归：只有 retired 名单、没有快照的 id 依旧完全不重放（H1 不许被放松）；
+//   ⑤ 恢复之后仍然是老账：拆分全 0 ⇒ 既有的「旧账金额补算」照旧生效，9 个计数一个不动；
+//   ⑥ 存档兼容：disposed 缺失 / 不是数组 / 元素残缺都照常加载，版本号仍是 2。
+//
+// 「写档 → **新进程**加载 → 同 id 复活」那一段在 test/persist.mjs —— 那边本来就是两次进程跑。
+// 本节所有场景都用**自己传的 config**（价目表 / 成本开关 / PERSIST），不依赖任何默认上限。
+{
+	/** 存档里一条 disposed 记录的形状：id + disposedAt + 13 个计数字段。 */
+	const H2_FIELDS = [
+		'totalInput',
+		'familyInput',
+		'output',
+		'requests',
+		'modelCalls',
+		'toolCalls',
+		'turn',
+		'turnInput',
+		'familyTurnInput',
+		'cacheReadInput',
+		'uncachedInput',
+		'costCny',
+		'lastModel'
+	];
+	/** 估价用的价目表：平／峰两列写成同一个数，金额就与「这笔样本什么时候到」无关。 */
+	const H2_PRICE = JSON.stringify({
+		default: { cacheHit: [3, 3], inputMiss: [5, 5], output: [7, 7] },
+		pro: { cacheHit: [11, 11], inputMiss: [13, 13], output: [17, 17] }
+	});
+	const archiveOf = () => (fs.existsSync(STATE_PATH) ? JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')) : null);
+	const putArchive = (payload) => fs.writeFileSync(STATE_PATH, JSON.stringify(payload), 'utf8');
+	const dropArchive = () => fs.rmSync(STATE_PATH, { force: true });
+	const parkedOf = (archive) => (Array.isArray(archive?.disposed) ? archive.disposed : []);
+	const parkedIds = (archive) => parkedOf(archive).map((item) => item?.id);
+	const countId = (list, id) => list.filter((item) => item?.id === id).length;
+	/** 本节自己的容差比：near 是两个相邻区块里的局部名字，这里不借它们的。 */
+	const near38 = (actual, expected) => typeof actual === 'number' && Math.abs(actual - expected) < 1e-6;
+	const logText38 = () => (fs.existsSync(LOG_PATH) ? fs.readFileSync(LOG_PATH, 'utf8') : '');
+	/** 日志被 logger 包了一层 `[loop-guard] ` 前缀：冻结文案说的是正文本身。 */
+	const body38 = (text) => String(text).replace(/^\[loop-guard\]\s*/, '');
+	/** 金额经过 roundCny / numberOr0，浮点用容差比；其余字段严格相等。 */
+	const same13 = (actual, expected) =>
+		actual !== null &&
+		typeof actual === 'object' &&
+		expected !== null &&
+		typeof expected === 'object' &&
+		H2_FIELDS.every((field) => {
+			const a = typeof actual[field] === 'number' ? actual[field] : Number.NaN;
+			return typeof expected[field] === 'number' ? Math.abs(a - expected[field]) < 1e-6 : actual[field] === expected[field];
+		});
+	/** 一行说清 13 个字段里哪几个对不上，断言失败时用。 */
+	const diff13 = (actual, expected) =>
+		JSON.stringify({
+			mismatch: H2_FIELDS.filter((field) => (typeof expected?.[field] === 'number' ? Math.abs((typeof actual?.[field] === 'number' ? actual[field] : Number.NaN) - expected[field]) >= 1e-6 : actual?.[field] !== expected?.[field])),
+			actual,
+			expected
+		});
+
+	// ── 38.1 注销时落盘：快照的 13 个字段与注销前的账本逐一相等 ──────────────────
+	dropArchive();
+	const h2 = harness({ DSH_LOOP_GUARD_PERSIST: 1, DSH_LOOP_GUARD_COST: 1, DSH_LOOP_GUARD_PRICE_TABLE: H2_PRICE });
+	const victim = { id: 'h2-park-a' };
+	const victimSub = h2.sub('h2-park-sub', 'h2-park-a');
+	// 计费输入按「缓存读 / 未命中 / 输出」分开喂，工具也真的走一次闸门；familyInput 靠子代理上卷 ——
+	// 这样 13 个字段里没有一个是因为两边都是 0 才碰巧相等。
+	h2.event(victim, { type: 'request/header', data: { header: { config: { provider: 'deepseek', model: 'deepseek-v4-flash' } } } });
+	h2.event(victim, {
+		type: 'assistant/chunk',
+		data: {
+			turn: 1,
+			step: 1,
+			chunk: { type: 'usage', usage: { inputTokens: 4_000_000, cacheReadTokens: 1_000_000, cacheWriteTokens: 0, outputTokens: 200_000 } }
+		}
+	});
+	h2.modelCall(victim);
+	h2.event(victim, {
+		type: 'assistant/chunk',
+		data: {
+			turn: 2,
+			step: 1,
+			chunk: { type: 'usage', usage: { inputTokens: 6_000_000, cacheReadTokens: 2_000_000, cacheWriteTokens: 0, outputTokens: 300_000 } }
+		}
+	});
+	h2.call(victim, 'read', { file_path: 'x' });
+	h2.created(victimSub);
+	h2.event(victimSub, {
+		type: 'assistant/chunk',
+		data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 500_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 10_000 } } }
+	});
+	// 借一个**没有账本**的替身 id 触发那一次无条件 writeState，把内存账本先照进 sessions：
+	// 这样「注销前的账本」是存档自己写出来的那一份，不是测试手抄的期望值。
+	h2.disposed({ id: 'h2-park-flush' });
+	const liveBefore = archiveOf()?.sessions?.['h2-park-a'];
+	h2.disposed(victim);
+	const parkedArchive = archiveOf();
+	const parked = parkedOf(parkedArchive).find((item) => item?.id === 'h2-park-a');
+	// toolCalls 故意**不**要求非 0：它的记账口（countExecutedTool）刚被实现者收口过一次，
+	// 值会随实现浮动；这里只要求「键在、是数字」。其余 12 个字段必须非 0 / 非空，
+	// 保证下面那条「13 个字段逐一相等」不是拿一堆 0 在空转。
+	check(
+		'38.1 前置：注销之前这份账本确实在存档里，且 13 个计数字段都是真值（比对不是空转）',
+		liveBefore !== undefined &&
+			liveBefore.requests === 2 &&
+			typeof liveBefore.toolCalls === 'number' &&
+			H2_FIELDS.every((field) => field === 'toolCalls' || (liveBefore[field] !== 0 && liveBefore[field] !== '')),
+		JSON.stringify(liveBefore)
+	);
+	check('38.1 注销之后 id 落进了存档的 disposed，而不是从存档里消失', parked !== undefined, JSON.stringify(parkedIds(parkedArchive)));
+	check(
+		'38.1 快照的 13 个计数字段与注销前的账本逐一相等',
+		same13(parked, liveBefore),
+		diff13(parked, liveBefore)
+	);
+	/**
+	 * 快照是「13 个计数 + id + disposedAt + 4 个豁免/逃生小本子」的**扁平**形状 ——
+	 * 这条断言就是防「图省事把整个账本对象塞进去」：账本上还有历史、工具签名表之类的
+	 * 大字段，真塞进去这一份存档会立刻涨成几十倍。
+	 */
+	const H2_EXTRA_KEYS = ['quotaExempted', 'escape', 'escapeSig', 'escapeSigUsed'];
+	check(
+		'38.1 快照就是扁平形状：13 个计数 + id + disposedAt + 4 个豁免/逃生小本子，没有把整个账本对象倒进去',
+		parked !== undefined &&
+			typeof parked.disposedAt === 'number' &&
+			parked.disposedAt > 0 &&
+			H2_FIELDS.every((field) => field in parked) &&
+			Object.keys(parked).sort().join(',') === [...H2_FIELDS, 'id', 'disposedAt', ...H2_EXTRA_KEYS].sort().join(','),
+		Object.keys(parked ?? {}).sort().join(',')
+	);
+	check(
+		'38.1 注销走的还是老规矩：id 也进了 retired（H1 的保护没被这次改动拆掉）',
+		(parkedArchive?.retired ?? []).includes('h2-park-a'),
+		JSON.stringify(parkedArchive?.retired?.slice(-3))
+	);
+	check(
+		'38.1 同一份存档里这个 id 不再出现在 sessions（内存账本确实放掉了，不是两边都留一份）',
+		parkedArchive?.sessions?.['h2-park-a'] === undefined,
+		JSON.stringify(parkedArchive?.sessions?.['h2-park-a'])
+	);
+
+	// ── 38.2 复活：接回计数、不重放历史、日志只含计数；取回即消费 ────────────────
+	let h2Replay = 0;
+	h2.created({
+		id: 'h2-park-a',
+		snapshotEvents: () => {
+			h2Replay += 1;
+			return [
+				{
+					type: 'assistant/chunk',
+					data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 777_000_000, outputTokens: 0 } } }
+				}
+			];
+		}
+	});
+	check('38.2 复活不重放历史：注入的 snapshotEvents 一次都没被调用', h2Replay === 0, `replayCalls=${h2Replay}`);
+	const reviveLines = h2.logs.filter(([level, text]) => level === 'info' && text.includes('会话复活，接着算：')).map(([, text]) => text);
+	const reviveLine = reviveLines.find((text) => text.includes('会话复活，接着算：h2-park-a')) ?? '';
+	check(
+		'38.2 复活写了那条冻结文案的 info 日志（会话复活，接着算： / 退休前 计费输入 / （不重放历史，也不给祖先重复上卷））',
+		reviveLine.includes('会话复活，接着算：h2-park-a') &&
+			reviveLine.includes('退休前 计费输入 ') &&
+			reviveLine.includes('（不重放历史，也不给祖先重复上卷）'),
+		JSON.stringify(reviveLines.slice(-1))
+	);
+	check(
+		'38.2 日志只说计数：形状就是「id ← 退休前 … token、请求 N 次、轮次 N、金额 ¥N、配额豁免 N 项 / 逃生计数 N 条（…）」',
+		/^会话复活，接着算：h2-park-a ← 退休前 计费输入 [\d.,]+ ?[万亿]? token、请求 2 次、轮次 2、金额 ¥[\d.]+、配额豁免 \d+ 项 \/ 逃生计数 \d+ 条（不重放历史，也不给祖先重复上卷）$/.test(
+			body38(reviveLine)
+		),
+		JSON.stringify(reviveLine)
+	);
+	check(
+		'38.2 日志里没有正文 / JSON / NUL / 换行（没有把账本对象倒进日志）',
+		body38(reviveLine) !== '' && !/[{}\[\]\u0000\n]/.test(body38(reviveLine)),
+		JSON.stringify(reviveLine)
+	);
+	h2.disposed({ id: 'h2-park-flush2' });
+	const afterRevive = archiveOf();
+	const liveAfter = afterRevive?.sessions?.['h2-park-a'];
+	check(
+		'38.2 取回即消费：同一份存档里这个 id 不再留在 disposed（不长期留两份账）',
+		parkedIds(afterRevive).every((id) => id !== 'h2-park-a'),
+		JSON.stringify(parkedIds(afterRevive).slice(0, 6))
+	);
+	check('38.2 计数整体回到了 sessions 里（13 个字段与注销前逐一相等）', same13(liveAfter, liveBefore), diff13(liveAfter, liveBefore));
+
+	// ── 38.3 上限：DISPOSED_CAP = 200，第 201 条进来时淘汰最旧那条（FIFO）────────
+	// 先把内存里剩下的旧条目全挤出去：连续 park 200 个替身（此刻表满，表里只可能是它们），
+	// 这样下面数出来的就是本节自己插的 201 条。
+	for (let index = 0; index < 200; index += 1) {
+		const dummy = { id: `h2-evict-dummy-${index}` };
+		h2.charge(dummy, 1, 1);
+		h2.disposed(dummy);
+	}
+	const logMark = logText38().length;
+	for (let index = 0; index < 201; index += 1) {
+		const capped = { id: `h2-cap-${index}` };
+		h2.charge(capped, 1, 1);
+		h2.disposed(capped);
+	}
+	const cappedArchive = archiveOf();
+	const cappedList = parkedOf(cappedArchive);
+	check('38.3 表满之后只剩 DISPOSED_CAP = 200 条', cappedList.length === 200, `共 ${cappedList.length} 条`);
+	check(
+		'38.3 最旧那条（第 1 条）被淘汰掉了：淘汰的正好是最旧，不是整体清空',
+		cappedList.length > 0 && countId(cappedList, 'h2-cap-0') === 0 && cappedList[0]?.id === 'h2-cap-1',
+		JSON.stringify(cappedList.slice(0, 3).map((item) => item?.id))
+	);
+	check(
+		'38.3 最新的那条还在，而且是数组最后一条（数组顺序就是淘汰顺序）',
+		cappedList[cappedList.length - 1]?.id === 'h2-cap-200' && countId(cappedList, 'h2-cap-200') === 1,
+		JSON.stringify(cappedList.slice(-2).map((item) => item?.id))
+	);
+	const logAfterCap = logText38();
+	check(
+		'38.3 淘汰按插入顺序淘汰最旧的一条（诊断日志里查得到，不是静默清空）',
+		logAfterCap.length > logMark && logAfterCap.includes('已注销账本表 已满，按插入顺序淘汰最旧的一条'),
+		`新增 ${logAfterCap.length - logMark} 字节`
+	);
+
+	// ── 38.4 老行为回归：只有 retired 名单、没有快照的 id 依旧完全不重放 ──────────
+	// 这正是「先退休、快照却不在表里」的形状：给一个**没有账本**的 id 注销 —— park 那一步
+	// 要求 ledgers.get(id) 存在，所以它只进 retired、不进 disposed。
+	h2.disposed({ id: 'h2-retired-only' });
+	check(
+		'38.4 前置：这个 id 只进了 retired、没进 disposed（否则下面的断言是空转）',
+		(archiveOf()?.retired ?? []).includes('h2-retired-only') && parkedIds(archiveOf()).every((id) => id !== 'h2-retired-only'),
+		JSON.stringify(parkedIds(archiveOf()).slice(0, 4))
+	);
+	let retiredReplay = 0;
+	h2.created({
+		id: 'h2-retired-only',
+		snapshotEvents: () => {
+			retiredReplay += 1;
+			return [
+				{
+					type: 'assistant/chunk',
+					data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 500_000_000, outputTokens: 0 } } }
+				}
+			];
+		}
+	});
+	check('38.4 只有 retired、没有快照的 id 复活：历史一次都不重放', retiredReplay === 0, `replayCalls=${retiredReplay}`);
+	let controlReplay = 0;
+	h2.created({
+		id: 'h2-retired-control',
+		snapshotEvents: () => {
+			controlReplay += 1;
+			return [
+				{
+					type: 'assistant/chunk',
+					data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 5_000_000, outputTokens: 0 } } }
+				}
+			];
+		}
+	});
+	check(
+		'38.4 反证：既没退休、也没快照的全新 id 照常吸收历史（0 次是守卫起作用，不是重放坏了）',
+		controlReplay === 1,
+		`replayCalls=${controlReplay}`
+	);
+	h2.disposed({ id: 'h2-retired-flush' });
+	const controlLive = archiveOf()?.sessions?.['h2-retired-control'];
+	const ghostLive = archiveOf()?.sessions?.['h2-retired-only'];
+	check('38.4 反证：控制组那 500 万真的记进了账本', controlLive?.totalInput === 5_000_000, JSON.stringify(controlLive));
+	check('38.4 retired-only 那个 id 依旧一分账都没有（历史被完全挡住）', ghostLive === undefined || ghostLive.totalInput === 0, JSON.stringify(ghostLive));
+
+	// ── 38.5 恢复之后仍然是老账：拆分全 0 ⇒ 既有的「旧账金额补算」照旧生效 ────────
+	// 真机里最要紧的一档：本版装载之前就开始记账的会话（77,652,325 token / 719 次请求），
+	// 存档里 cacheRead / uncached / costCny 全是 0。恢复完之后**没有第二次补算机会**，
+	// 所以这一次必须补上：金额 > 0，而 9 个计数一个都不许动（历史只用来补金额）。
+	dropArchive();
+	const legacyParked = {
+		id: 'h2-legacy',
+		disposedAt: 1_760_000_000_000,
+		totalInput: 77_652_325,
+		familyInput: 0,
+		output: 1_234,
+		requests: 719,
+		modelCalls: 700,
+		toolCalls: 42,
+		turn: 12,
+		turnInput: 5_000_000,
+		familyTurnInput: 0,
+		cacheReadInput: 0,
+		uncachedInput: 0,
+		costCny: 0,
+		lastModel: ''
+	};
+	const legacyUntouched = ['totalInput', 'familyInput', 'output', 'requests', 'modelCalls', 'toolCalls', 'turn', 'turnInput', 'familyTurnInput'];
+	putArchive({
+		version: 2,
+		savedAt: new Date().toISOString(),
+		retired: ['h2-legacy'],
+		disposed: [legacyParked],
+		sessions: {},
+		stats: {}
+	});
+	const legacyEvents = [
+		{ type: 'request/header', data: { header: { config: { provider: 'deepseek', model: 'deepseek-v4-flash' } } } },
+		{
+			type: 'assistant/chunk',
+			data: {
+				turn: 12,
+				step: 1,
+				chunk: { type: 'usage', usage: { inputTokens: 3_000_000, cacheReadTokens: 2_000_000, cacheWriteTokens: 0, outputTokens: 1_000_000 } }
+			}
+		}
+	];
+	const h5 = harness({ DSH_LOOP_GUARD_PERSIST: 1, DSH_LOOP_GUARD_COST: 1, DSH_LOOP_GUARD_PRICE_TABLE: H2_PRICE });
+	h5.created({ id: 'h2-legacy', snapshotEvents: () => legacyEvents });
+	h5.disposed({ id: 'h2-legacy-flush' });
+	const legacyLive = archiveOf()?.sessions?.['h2-legacy'];
+	check(
+		'38.5 恢复 + 补算：9 个计数一个都没动（token 与请求数只来自快照，历史只用来补金额）',
+		legacyLive !== undefined && legacyUntouched.every((field) => legacyLive[field] === legacyParked[field]),
+		JSON.stringify({ actual: legacyLive, expected: legacyParked })
+	);
+	check(
+		'38.5 金额真的补上了（不是留着 ¥0.00、再没有第二次机会）',
+		typeof legacyLive?.costCny === 'number' && legacyLive.costCny > 0,
+		JSON.stringify(legacyLive)
+	);
+	check(
+		'38.5 金额按注入的历史算：2 百万 × 3 + 3 百万 × 5 + 1 百万 × 7 = 28 元',
+		near38(legacyLive?.costCny, 28),
+		String(legacyLive?.costCny)
+	);
+	check(
+		'38.5 拆分字段被补算填上：cacheReadInput 2 百万 / uncachedInput 3 百万 / lastModel 认出了这一轮的模型',
+		legacyLive?.cacheReadInput === 2_000_000 && legacyLive?.uncachedInput === 3_000_000 && legacyLive?.lastModel === 'deepseek-v4-flash',
+		JSON.stringify(legacyLive)
+	);
+	check(
+		'38.5 补算日志照旧（只补金额，token 一概未动）',
+		h5.logs.some(([level, text]) => level === 'info' && text.includes('旧账补算') && text.includes('只补金额，token 一概未动')),
+		JSON.stringify(h5.logs.filter(([, text]) => text.includes('补算')).slice(-1))
+	);
+	const legacyReviveLine = h5.logs.filter(([level, text]) => level === 'info' && text.includes('会话复活，接着算：h2-legacy')).map(([, text]) => text)[0] ?? '';
+	check(
+		'38.5 有快照的会话走的是「接回计数 + 补金额」两步（复活日志里的三个数字就是快照里的那三个）',
+		/^会话复活，接着算：h2-legacy ← 退休前 计费输入 [\d.,]+ ?[万亿]? token、请求 719 次、轮次 12、金额 ¥[\d.]+、配额豁免 \d+ 项 \/ 逃生计数 \d+ 条（不重放历史，也不给祖先重复上卷）$/.test(
+			body38(legacyReviveLine)
+		),
+		JSON.stringify(legacyReviveLine)
+	);
+
+	// ── 38.6 存档兼容：disposed 缺失 / 不是数组 / 元素残缺 ──────────────────────
+	// (a) 老存档根本没有 disposed 这个键（本版之前的存档就是这样）：照常加载。
+	dropArchive();
+	putArchive({
+		version: 2,
+		savedAt: new Date().toISOString(),
+		retired: [],
+		sessions: {
+			'h2-compat-session': {
+				totalInput: 4_000_000,
+				familyInput: 0,
+				output: 0,
+				requests: 4,
+				modelCalls: 4,
+				toolCalls: 0,
+				turn: 2,
+				turnInput: 1_000_000,
+				familyTurnInput: 0
+			}
+		},
+		stats: { sessions: 1, denied: 0, released: 0, exempted: 0, updatedAt: '2024-01-01T00:00:00.000Z' }
+	});
+	const h6 = harness({ DSH_LOOP_GUARD_PERSIST: 1 });
+	const compatVerdict = await h6.call({ id: 'h2-compat-session' }, 'read', { file_path: 'x' });
+	check('38.6a 没有 disposed 键的老存档照常加载（sessions 照旧恢复、照常放行）', compatVerdict?.kind !== 'deny', brief(compatVerdict));
+	h6.created({ id: 'h2-compat-nokey', snapshotEvents: () => [] });
+	h6.disposed({ id: 'h2-compat-flush' });
+	const arch6 = archiveOf();
+	check('38.6a 写回去的存档版本号仍是 2（纯加字段，不换版本）', arch6?.version === 2, String(arch6?.version));
+	check(
+		'38.6a disposed 写出来一定是数组（没有这个键时就是空表，不会是 undefined）',
+		Array.isArray(arch6?.disposed),
+		Array.isArray(arch6?.disposed) ? `数组，${arch6.disposed.length} 条` : `typeof=${typeof arch6?.disposed}`
+	);
+
+	// (b) disposed 不是数组（手工改坏 / 将来换过形状）：当空表处理，不许炸。
+	dropArchive();
+	putArchive({
+		version: 2,
+		savedAt: new Date().toISOString(),
+		retired: [],
+		disposed: { 'h2-compat-nonarray': { requests: 9, totalInput: 9_000_000 } },
+		sessions: {},
+		stats: {}
+	});
+	const h7 = harness({ DSH_LOOP_GUARD_PERSIST: 1 });
+	h7.created({ id: 'h2-compat-nonarray', snapshotEvents: () => [] });
+	h7.disposed({ id: 'h2-compat-nonarray-flush' });
+	const nonArrayLive = archiveOf()?.sessions?.['h2-compat-nonarray'];
+	check(
+		'38.6b disposed 不是数组时按空表处理（对象里的那条没有被当成快照读进来）',
+		h7.hasPre === true && (nonArrayLive?.requests ?? 0) === 0 && (nonArrayLive?.totalInput ?? 0) === 0,
+		JSON.stringify(nonArrayLive)
+	);
+
+	// (c) 数组里的元素残缺 / 是垃圾：坏的跳掉、好的照常读，缺字段按 0 与空串兜底。
+	dropArchive();
+	putArchive({
+		version: 2,
+		savedAt: new Date().toISOString(),
+		retired: [],
+		sessions: {},
+		stats: {},
+		disposed: [
+			null,
+			42,
+			'x',
+			{},
+			{ id: '' },
+			{ id: 'h2-compat-partial', requests: 3, totalInput: 1_500_000 },
+			{ id: 'h2-compat-partial', requests: 999 },
+			{ id: 'h2-compat-ok', totalInput: 7_000_000, requests: 7, lastModel: 'deepseek-v4-flash' }
+		]
+	});
+	const h8 = harness({ DSH_LOOP_GUARD_PERSIST: 1 });
+	h8.created({ id: 'h2-compat-partial', snapshotEvents: () => [] });
+	h8.created({ id: 'h2-compat-ok', snapshotEvents: () => [] });
+	h8.disposed({ id: 'h2-compat-flush2' });
+	const arch8 = archiveOf();
+	const partialLive = arch8?.sessions?.['h2-compat-partial'];
+	const okLive = arch8?.sessions?.['h2-compat-ok'];
+	check(
+		'38.6c 残缺元素照常读、缺字段按 0 与空串兜底（requests 3、totalInput 150 万，其余计数字段全 0、lastModel 空串）',
+		partialLive?.requests === 3 &&
+			partialLive?.totalInput === 1_500_000 &&
+			partialLive?.output === 0 &&
+			partialLive?.turn === 0 &&
+			partialLive?.cacheReadInput === 0 &&
+			partialLive?.costCny === 0 &&
+			partialLive?.lastModel === '',
+		JSON.stringify(partialLive)
+	);
+	check(
+		'38.6c 存档里同一个 id 出现两次时只认第一条（没有被后面的 999 覆盖）',
+		partialLive?.requests === 3,
+		JSON.stringify(partialLive)
+	);
+	check(
+		'38.6c 好元素照常读：h2-compat-ok 的 700 万与 7 次请求都在',
+		okLive?.totalInput === 7_000_000 && okLive?.requests === 7 && okLive?.lastModel === 'deepseek-v4-flash',
+		JSON.stringify(okLive)
+	);
+	check(
+		'38.6c 垃圾元素没有被写回存档（null / 数字 / 空 id / 没有 id 的都没变成记录）',
+		Array.isArray(arch8?.disposed) &&
+			arch8.disposed.every((item) => item !== null && typeof item === 'object' && typeof item.id === 'string' && item.id !== ''),
+		JSON.stringify(arch8?.disposed?.length)
+	);
+	check(
+		'38.6c 存档里同一个 id 出现两次时只留下一条（按 id 去重，不是两条都留着）',
+		parkedIds(arch8).length === new Set(parkedIds(arch8)).size,
+		JSON.stringify(parkedIds(arch8).filter((id) => id === 'h2-compat-partial').length === 0 ? '已被复活消费' : parkedIds(arch8))
+	);
+	check('38.6c 版本号仍是 2', arch8?.version === 2, String(arch8?.version));
+}
+
 // ══════════ 26. 测试隔离：真账本与真日志一个字节都不许动 ══════════
 {
 	const stateAfter = snapshot(REAL_STATE);
 	const logAfter = snapshot(REAL_LOG);
-	check(`测试全程没有写/改真账本（${REAL_STATE}）`, stateAfter === realStateBefore, stateAfter === realStateBefore ? '' : '真账本被改动了');
-	check(`测试全程没有写/改真日志（${REAL_LOG}）`, logAfter === realLogBefore, logAfter === realLogBefore ? '' : '真日志被改动了');
+	// 本机的活账本是按 profile 分文件的（~/.dsh/loop-guard-state.<profile>.json），旧全局路径通常
+	// 已经不存在。这时两侧都是 null，断言只剩「旧路径没被创建/改写」这一层含义 —— 不跳过（计数要留住），
+	// 但用 SKIP 行如实说明；活账本正被运行中的宿主不断改写，不能拿来当比对靶子。
+	const stateVacuous = realStateBefore === null && stateAfter === null;
+	const logVacuous = realLogBefore === null && logAfter === null;
+	if (stateVacuous) console.log(`SKIP  真账本 ${REAL_STATE} 不存在（本机已改用按 profile 的账本），本断言退化为「旧路径未被创建/改写」`);
+	if (logVacuous) console.log(`SKIP  真日志 ${REAL_LOG} 不存在，本断言退化为「旧路径未被创建/改写」`);
+	check(
+		stateVacuous
+			? `测试全程没有写/改真账本（旧全局路径 ${REAL_STATE} 不存在，本断言退化为「旧路径未被创建/改写」）`
+			: `测试全程没有写/改真账本（${REAL_STATE}）`,
+		stateAfter === realStateBefore,
+		stateAfter === realStateBefore ? '' : '真账本被改动了'
+	);
+	check(
+		logVacuous
+			? `测试全程没有写/改真日志（旧全局路径 ${REAL_LOG} 不存在，本断言退化为「旧路径未被创建/改写」）`
+			: `测试全程没有写/改真日志（${REAL_LOG}）`,
+		logAfter === realLogBefore,
+		logAfter === realLogBefore ? '' : '真日志被改动了'
+	);
 	for (const file of [STATE_PATH, LOG_PATH, `${STATE_PATH}.tmp`]) {
 		if (fs.existsSync(file)) fs.rmSync(file, { force: true });
 	}

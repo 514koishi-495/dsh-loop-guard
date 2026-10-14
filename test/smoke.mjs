@@ -124,40 +124,29 @@ const isDeny = (v, code) => v?.kind === 'deny' && (code === undefined || v.info.
 const allowed = (v) => v === undefined || v.kind !== 'deny';
 
 // ══════════════════ A. 基础：口径、重复、交账、默认不设限 ══════════════════
+//
+// 这一段拆成两半，因为两半的口径要求正好相反：
+//   A1 测的是「单轮预算」这道门自己（口径、预警比例、到线交账）——
+//      必须用默认上限 6000 万，不许靠抬上限来绕，否则等于把这条门的默认口径从测试里删掉；
+//   A2 测的是别的门（同签名重复 / 逃生门 / 换命令 / 豁免工具 / 会话默认不设限）——
+//      它们只是路过本轮门，所以显式把本轮上限抬到 10 亿，把本轮门排除出去。
 {
+	// ── A1. 单轮预算门自身的默认口径：上限 6000 万，warnRatio 0.7 ⇒ 4200 万预警 ──
 	const h = harness();
 	const agent = { session: h.session('a-base') };
 	const call = (name, args) => h.call({ name, arguments: args, agent });
 
 	// 1. 计费输入 = 非缓存 + 缓存读 + 缓存写
-	h.charge(h.session('a-base'), 40_000_000);
-	h.charge(h.session('a-base'), 20_000_000);
+	h.charge(h.session('a-base'), 25_000_000);
+	h.charge(h.session('a-base'), 15_000_000);
+	check('40M 未触发预警（阈值 4200 万）', !h.logs.some(([, m]) => m.includes('本轮已用')));
+
+	// 2. 越过 4200 万的那一刻喊一次预警
 	h.charge(h.session('a-base'), 5_000_000);
-	check('65M 未触发预警（阈值 70M）', !h.logs.some(([, m]) => m.includes('本轮已用')));
+	check('到 45M 打出预警（阈值 4200 万）', h.logs.some(([, m]) => m.includes('本轮已用')));
 
-	// 2. 正常调用放行
-	const exec = { name: 'pwsh', arguments: { command: 'echo hello' }, agent };
-	check('第一次调用放行', allowed(await h.call(exec)));
-
-	// 3. 同签名重复：阈值 4，第 5 次拦
-	for (let i = 0; i < 3; i += 1) await h.call(exec);
-	const fifth = await h.call(exec);
-	check('同签名第 5 次被拦', isDeny(fifth, 'LOOP_GUARD_REPEAT'), JSON.stringify(fifth?.info));
-
-	// 4. 逃生门
-	await h.call(exec);
-	await h.call(exec);
-	check('拦满 3 次后放行（不锁死 agent）', allowed(await h.call(exec)));
-
-	// 5. 换命令 = 换签名
-	check('换命令立刻放行', allowed(await call('pwsh', { command: 'echo goodbye' })));
-
-	// 6. 预警
-	h.charge(h.session('a-base'), 10_000_000);
-	check('到 75M 打出预警', h.logs.some(([, m]) => m.includes('本轮已用')));
-
-	// 7. 预算到线：硬停手 + 交账报告三要素
-	h.charge(h.session('a-base'), 30_000_000);
+	// 3. 预算到线：硬停手 + 交账报告三要素
+	h.charge(h.session('a-base'), 20_000_000);
 	const tripped = await call('read', { file_path: 'C:\\whatever\\x.txt' });
 	check('预算用尽后拦截', isDeny(tripped, 'LOOP_GUARD_BUDGET_EXHAUSTED'), JSON.stringify(tripped?.info));
 	check('交账报告要求「已经做完」', (tripped?.reason ?? '').includes('已经做完什么'));
@@ -165,11 +154,36 @@ const allowed = (v) => v === undefined || v.kind !== 'deny';
 	check('交账报告要求「建议怎么继续」', (tripped?.reason ?? '').includes('建议用户怎么继续'));
 	check('预算用尽后连 read 也拦', isDeny(await call('read', { file_path: 'C:\\a\\b.txt' })));
 
-	// 8. 换 turn = 换一次问答
+	// 4. 换 turn = 换一次问答
 	h.charge(h.session('a-base'), 1000, { turn: 2 });
 	check('换新一轮问答后恢复放行', allowed(await call('read', { file_path: 'C:\\a\\b.txt' })));
+}
 
-	// 9. 豁免工具永不拦（真的连发 12 次，断言全部放行 —— 不能写成恒真的 `check(…, true)`）
+{
+	// ── A2. 同签名重复 / 逃生门 / 换命令 / 豁免工具 / 会话默认不设限 ──
+	// 这一组测的不是本轮门：显式抬到 10 亿，并换一组会话 id（谱系表是模块级的，id 不能重叠）。
+	const h = harness({ DSH_LOOP_GUARD_MAX_TOKENS: 1_000_000_000 });
+	const agent = { session: h.session('a2-base') };
+	const call = (name, args) => h.call({ name, arguments: args, agent });
+
+	// 5. 正常调用放行
+	const exec = { name: 'pwsh', arguments: { command: 'echo hello' }, agent };
+	check('第一次调用放行', allowed(await h.call(exec)));
+
+	// 6. 同签名重复：阈值 4，第 5 次拦
+	for (let i = 0; i < 3; i += 1) await h.call(exec);
+	const fifth = await h.call(exec);
+	check('同签名第 5 次被拦', isDeny(fifth, 'LOOP_GUARD_REPEAT'), JSON.stringify(fifth?.info));
+
+	// 7. 逃生门
+	await h.call(exec);
+	await h.call(exec);
+	check('拦满 3 次后放行（不锁死 agent）', allowed(await h.call(exec)));
+
+	// 8. 换命令 = 换签名
+	check('换命令立刻放行', allowed(await call('pwsh', { command: 'echo goodbye' })));
+
+	// 9. 豁免工具永不拦（真的连发 12 次，断言全部放行 —— 不能写成恒真的断言）
 	const todos = [];
 	for (let i = 0; i < 12; i += 1) todos.push(await call('todo_write', { todos: [] }));
 	check(
@@ -178,8 +192,8 @@ const allowed = (v) => v === undefined || v.kind !== 'deny';
 		JSON.stringify(todos.find((v) => !allowed(v)))?.slice(0, 80)
 	);
 
-	// 10. 会话累计上限默认关闭
-	for (const turn of [3, 4, 5]) h.charge(h.session('a-base'), 90_000_000, { turn });
+	// 10. 会话累计上限默认关闭（本轮上限已抬到 10 亿，90M/轮 碰不到本轮门）
+	for (const turn of [3, 4, 5]) h.charge(h.session('a2-base'), 90_000_000, { turn });
 	check('会话累计 2.7 亿也不拦（默认不设限）', allowed(await call('pwsh', { command: 'echo zzz' })));
 }
 
@@ -195,10 +209,10 @@ const allowed = (v) => v === undefined || v.kind !== 'deny';
 
 // ══════════════════ C. 家族总预算：后代的账上卷到祖先 ══════════════════
 {
-	const h = harness({ DSH_LOOP_GUARD_FAMILY_MAX_TOKENS: 200_000_000 });
+	const h = harness({ DSH_LOOP_GUARD_FAMILY_MAX_TOKENS: 200_000_000, DSH_LOOP_GUARD_MAX_TOKENS: 1_000_000_000 });
 	const root = h.session('c-root');
 	const child = h.session('c-child', 'c-root');
-	// 分多轮累计到 2.8 亿：单轮谁都不碰 1 亿的本轮上限，走的才是家族闸门。
+	// 分多轮累计到 2.8 亿：本轮上限显式抬到 10 亿，单轮谁都不碰它，走的才是家族闸门。
 	// 根会话每轮自己也要记一笔 —— 它不说话就没有 turn，换轮清账也就无从谈起。
 	for (const turn of [1, 2, 3, 4]) {
 		h.charge(root, 1_000_000, { turn });
@@ -380,8 +394,27 @@ const allowed = (v) => v === undefined || v.kind !== 'deny';
 	// 这正是「测试隔离」那句话的可验证形式：跑完 60 多个场景，两样都原样不动。
 	const stateAfter = sha256(REAL_STATE);
 	const logAfter = sha256(REAL_LOG);
-	check(`测试全程没有写/改真账本（${REAL_STATE}）`, stateAfter === realStateBefore, `${realStateBefore} → ${stateAfter}`);
-	check(`测试全程没有写/改真日志（${REAL_LOG}）`, logAfter === realLogBefore, `${realLogBefore} → ${logAfter}`);
+	// 本机的活账本是按 profile 分文件的（~/.dsh/loop-guard-state.<profile>.json），旧全局路径通常
+	// 已经不存在。这时两侧都是 '<absent>'，断言只剩「旧路径没被创建/改写」这一层含义 —— 不跳过
+	// （计数要留住），但用 SKIP 行如实说明；活账本正被运行中的宿主不断改写，不能拿来当比对靶子。
+	const stateVacuous = realStateBefore === '<absent>' && stateAfter === '<absent>';
+	const logVacuous = realLogBefore === '<absent>' && logAfter === '<absent>';
+	if (stateVacuous) console.log(`SKIP  真账本 ${REAL_STATE} 不存在（本机已改用按 profile 的账本），本断言退化为「旧路径未被创建/改写」`);
+	if (logVacuous) console.log(`SKIP  真日志 ${REAL_LOG} 不存在，本断言退化为「旧路径未被创建/改写」`);
+	check(
+		stateVacuous
+			? `测试全程没有写/改真账本（旧全局路径 ${REAL_STATE} 不存在，本断言退化为「旧路径未被创建/改写」）`
+			: `测试全程没有写/改真账本（${REAL_STATE}）`,
+		stateAfter === realStateBefore,
+		`${realStateBefore} → ${stateAfter}`
+	);
+	check(
+		logVacuous
+			? `测试全程没有写/改真日志（旧全局路径 ${REAL_LOG} 不存在，本断言退化为「旧路径未被创建/改写」）`
+			: `测试全程没有写/改真日志（${REAL_LOG}）`,
+		logAfter === realLogBefore,
+		`${realLogBefore} → ${logAfter}`
+	);
 }
 
 // 测试自己的临时文件也收掉，别在 test/ 下留垃圾。

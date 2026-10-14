@@ -5,10 +5,11 @@
 #   1. 从 profile 的 package.json 里摘掉 dsh.profile.bundles 里的 dsh-loop-guard
 #   2. 摘掉 dependencies 里的 file: 条目
 #   3. 删掉 node_modules\dsh-loop-guard
-#   4. **默认不动**账本存档（~\.dsh\loop-guard-state.json）与诊断日志（~\.dsh\loop-guard.log）
-#      —— 这两个文件在 ~\.dsh 下，是**所有 profile 共用**的：在 desktop 上卸载顺手删掉它们，
-#      会连别的 profile 的账本与历史日志一起清掉。要删得显式说 -PurgeState / -PurgeLog，
-#      而且删之前会先备份进 .loop-guard-backup\files-<时间戳>\。
+#   4. **默认不动** ~\.dsh 下的账本（老名 loop-guard-state.json、每个 profile 一份的
+#      loop-guard-state.<profile>.json、迁移残留 loop-guard-state.json.migrated）与诊断日志
+#      （loop-guard.log）—— 这些文件在 ~\.dsh 下，是**所有 profile 共用**的：在 desktop 上
+#      卸载顺手删掉它们，会连别的 profile 的账本与历史日志一起清掉。要删得显式说
+#      -PurgeState / -PurgeLog，而且删之前会先备份进 .loop-guard-backup\files-<时间戳>\。
 #
 # 备份目录 .loop-guard-backup\ 里，每次卸载都会留一份带时间戳的
 # package.json.<yyyyMMdd-HHmmss>.bak（**本次**卸载前的状态），另外维护一份
@@ -26,9 +27,10 @@
 # 参数：
 #   -ProfileDir <路径>  指定 profile 目录；不给就先用 profiles\desktop，再自动探测
 #                       （profiles\* 里 package.json 提到 dsh-loop-guard 的那个）
-#   -PurgeState   连账本存档一起清掉（删前备份）
+#   -PurgeState   连 ~\.dsh 下**所有**账本一起清掉：老名、每个 profile 的分片、以及
+#                 *.json.migrated 残留（删前备份）
 #   -PurgeLog     连诊断日志一起清掉（删前备份）
-#   -KeepState    保留账本存档（这是默认行为，保留只为兼容旧命令）
+#   -KeepState    保留账本（这是默认行为，保留只为兼容旧命令）
 #   -KeepLog      保留诊断日志（同上）
 #   -KeepSource   不提示源码目录还在（只是少打一行字）
 
@@ -71,8 +73,17 @@ if ($ProfileDir) {
 
 $pkgPath = Join-Path $profileDir 'package.json'
 $pluginDir = Join-Path $profileDir 'node_modules\dsh-loop-guard'
-$statePath = Join-Path $env:USERPROFILE '.dsh\loop-guard-state.json'
-$logPath = Join-Path $env:USERPROFILE '.dsh\loop-guard.log'
+$stateDir = Join-Path $env:USERPROFILE '.dsh'
+$logPath = Join-Path $stateDir 'loop-guard.log'
+# 账本已经按 profile 分片了：老名 loop-guard-state.json、分片 loop-guard-state.<profile>.json，
+# 还有首次迁移留下的残留 loop-guard-state.json.migrated。写死老名会漏掉后两种，所以这里枚举。
+# 三个模式是实测过的（-like 的通配行为不能想当然）：老名不会被 'loop-guard-state.*.json' 命中
+# （后者要求名字里有两个点，老名只有一个点），残留名也不以 .json 结尾，所以三者必须并列。
+# 这里只枚举、不删：删要显式 -PurgeState。
+$stateLedgers = @(Get-ChildItem -Path $stateDir -File -ErrorAction SilentlyContinue | Where-Object {
+		$name = $_.Name
+		($name -like 'loop-guard-state.json') -or ($name -like 'loop-guard-state.*.json') -or ($name -like 'loop-guard-state.json.migrated')
+	} | Sort-Object -Property FullName | ForEach-Object { $_.FullName })
 
 if (-not (Test-Path $pkgPath)) { throw "找不到 profile 的 package.json：$pkgPath" }
 
@@ -113,6 +124,10 @@ if ($sameAsLatest) {
 # 以前用整文件 ConvertTo-Json 重写：字段顺序、缩进、转义都可能被动过，diff 里全是噪声，
 # 还可能把 name 之类的字段转义掉。现在直接对原文做最小的文本手术：只删掉目标那一行；
 # 若它正好是数组/对象的最后一项，再把上一行留下的悬空逗号一起摘掉。
+# 写回时按原编码：README 承诺保留原编码，而下面是纯文本手术 —— 只有 BOM 会被 WriteAllText 的属性决定。
+# 所以先按字节看一眼原文件有没有 UTF-8 BOM，有就带着写回，没有就写无 BOM。
+$pkgBytes = [System.IO.File]::ReadAllBytes($pkgPath)
+$hadBom = ($pkgBytes.Length -ge 3) -and ($pkgBytes[0] -eq 0xEF) -and ($pkgBytes[1] -eq 0xBB) -and ($pkgBytes[2] -eq 0xBF)
 $original = Get-Content $pkgPath -Raw -Encoding UTF8
 $beforePkg = $original | ConvertFrom-Json   # 原文必须先能解析，否则不动它
 $hadBundle = @($beforePkg.dsh.profile.bundles) -contains 'dsh-loop-guard'
@@ -181,7 +196,8 @@ if ($text -eq $original) {
 		throw "package.json 自检没过，已从 $stampedBackup 还原：`n - $($problems -join "`n - ")"
 	}
 
-	[System.IO.File]::WriteAllText($pkgPath, $text, (New-Object System.Text.UTF8Encoding($false)))
+	$encoding = New-Object System.Text.UTF8Encoding($hadBom)
+	[System.IO.File]::WriteAllText($pkgPath, $text, $encoding)
 	Write-Host "已从 package.json 摘掉 dsh-loop-guard（删了 $($removedLines.Count) 行、改了 $($addedLines.Count) 行，其余字节未动）"
 }
 
@@ -196,14 +212,16 @@ if (Test-Path $pluginDir) {
 
 # ── 账本与日志：默认不动 ──
 #
-# 这两个文件在 ~\.dsh 下，是**所有 profile 共用**的（谁在跑谁就往里写）。以前默认删掉它们，
+# 这些文件在 ~\.dsh 下，是**所有 profile 共用**的（谁在跑谁就往里写）。以前默认删掉它们，
 # 等于在 desktop 上卸载会顺手清掉别的 profile 的账本与历史日志，而且删了不留备份。
 # 现在默认留着；要删得显式说 -PurgeState / -PurgeLog，删之前先备份进 .loop-guard-backup\。
+# 账本已按 profile 分片（枚举见上面的 $stateLedgers），所以 -PurgeState 一次清掉枚举到的每一份，
+# 而不是只认老名那一个文件。
 if ($KeepState -or $KeepLog) {
-	Write-Host '（-KeepState / -KeepLog 现在就是默认行为，可以省掉：这两个文件默认不删）'
+	Write-Host '（-KeepState / -KeepLog 现在就是默认行为，可以省掉：这些文件默认不删）'
 }
 $purgeTargets = @()
-if ($PurgeState -and (Test-Path $statePath)) { $purgeTargets += $statePath }
+if ($PurgeState) { $purgeTargets += $stateLedgers }
 if ($PurgeLog -and (Test-Path $logPath)) { $purgeTargets += $logPath }
 if ($purgeTargets.Count -gt 0) {
 	$fileBackup = Join-Path $backup "files-$stamp"
@@ -214,7 +232,8 @@ if ($purgeTargets.Count -gt 0) {
 		Write-Host "已删掉 $target（删前已备份到 $fileBackup）"
 	}
 } else {
-	$leftAlone = @($statePath, $logPath) | Where-Object { Test-Path $_ }
+	$leftAlone = @($stateLedgers)
+	if (Test-Path $logPath) { $leftAlone += $logPath }
 	if ($leftAlone.Count -gt 0) {
 		Write-Host "账本与日志留着了（在 ~\.dsh 下，所有 profile 共用）：$($leftAlone -join '、')"
 		Write-Host '要连它们一起清掉，加 -PurgeState -PurgeLog（删前会先备份到 .loop-guard-backup\）。'

@@ -1,5 +1,58 @@
 # 变更记录
 
+## 1.1.5（2026-10-14）
+
+**主题：把「逃生门有两套语义」「到线之后怎么收尾」写成真话，并给「钱花到哪了」补上看得见的地方。**
+
+- **三道预算门（本轮 / 会话 / 家族；软着陆开启时再加一道软着陆门）也走逃生门，语义分两类。** 文档原来笼统写「每一处拦截都带逃生门：同一处连拦 3 次之后
+  一律放行一次」，而本轮 / 会话 / 家族三道预算门当时的实现是裸 `return deny(...)`：到线就永久拦死；
+  README 里「重启就是最后一道手动解锁」对会话级预算也不成立（`totalInput` 会从存档恢复）。现在：
+  **重复类闸门**（同签名 / 同骨架 / 同错误 / 乒乓循环 / 横向异常）与**三道预算门** =
+  同一处连拦 `maxDenials`（默认 3）次后放行一次；**配额类闸门**（子代理请求数 / 子代理工具数 /
+  扇出并发 / workflow 扇出 / 空跑熔断）= 首超那次 warn + 放行一次，此后一直拦。两种放行都打 warn，日志里查得到。
+- **免拦工具挪到预算门之前判定。** `job_kill` / `ask_user_question` / `update_goal` / `get_goal` /
+  `todo_write` / `todo_read` / `acp_status` / `acp_cache` / `search_context` / `job_list` / `job_output`
+  在任意预算门到线时仍然可用，`toolName === ''`（非工具步骤）同样放行。
+  **为什么必须改**：到线之后 agent 总得有一条收尾的路，否则用户看到的是一个不说话的会话，
+  而不是一份交账报告。
+- **计数表满了按 FIFO 淘汰，不再整体 `clear()`。** 整体清空会把「已连拦几次」的逃生计数一起归零 ——
+  那正是「越拦越死」的成因。逃生计数改存一张按签名散列的独立表（`ESCAPE_CAP` = 400），
+  前缀超限时淘汰最旧的一条，被淘汰的签名重新计数（只会更严，不会锁死）。
+- **shell 归一化收窄。** 老规则把任何 `xxxx.log` 折成 `<tmpfile>`，于是 `Get-Content build1.log` 与
+  `Get-Content build5.log` 撞成同一签名、被当成「重复」。现在只折确定是临时产物的名字，
+  同一份日志反复取仍然会命中重复门。`read` / `grep` / `glob` 的路径保留行为不变。
+- **`stripCodeLiterals` 改成先剥字符串再剥注释。** 含 `https://example.com/a//b` 的命令原来会被 `//`
+  截断，后面真正的 `agent()` 调用数不到。
+- **workflow 估数不再只认 `pipeline|parallel`。** `for (const f of args.files) await agent(...)` 这类
+  现在也按 `args.files` 的长度算乘数，仍受 `Math.min(乘数, 1000)` 约束 —— 5000 元素的数组不会估成 5000 个。
+- **`0` / 负数的口径统一。** `MAX_TOKENS` 设 `0` 原来等于「已发生 ≥ 0 恒真」，也就是每一步都拦；
+  现在 `MAX_TOKENS` / `SESSION_MAX_TOKENS` / `FAMILY_MAX_TOKENS` 的 `0` 与计数类阈值的 `0` 语义一致：
+  **不设限 / 关掉那道门**。
+- **存档版本迁移。** `version` 与当前不一致时不再整份丢弃，按已知字段尽力迁移
+  （`totalInput` / `familyInput` / `turn`），并写一条 warn 说明迁了什么。
+- **新增：会话头用量徽标。** 客户端半边 `lib/client.js` 在会话头右侧显示「会话累计 / 本轮」计费输入
+  （`input + cacheRead + cacheWrite`，含这一轮生出来的子代理），1.5 秒轮询只读端点
+  `GET /api/loop-guard/usage?sessionId=<id>`（响应含 `session` / `turn` / `limits` / `tripped` /
+  `updatedAt`）；预算门到线时变红并写明是哪一道。宿主没有 `webServer` 服务时插件照常加载，
+  只是没有徽标数据。
+- **新增：诊断日志文件。** 默认 `~/.dsh/loop-guard.log`，`DSH_LOOP_GUARD_LOG_FILE` 覆盖，
+  `DSH_LOOP_GUARD_LOG=0` 关闭。只写 warn/error 这几类：**逃生门放行**、**预算门首次到线**、
+  **盲区自检**、**存档版本迁移**、**写盘失败**、**FIFO 淘汰**。单文件上限 2MB，超了轮转成
+  `loop-guard.log.1`（只留一份）；同一条消息 10 秒内只写一次。**写日志失败不影响闸门**：
+  出错就置标志位、此后不再尝试，判定照常。
+- **文档 / 测试 / 卸载脚本对齐。** README 补上 `DSH_LOOP_GUARD_PERSIST` / `NO_PERSIST` / `STATE_FILE` /
+  `LOG` / `LOG_FILE` 与「手动解锁预算门」的真实动作（删存档里该会话那条记录，或把对应上限调高 / 设 `0`，
+  都要重启一次才生效）；SKILL.md 的阈值口径按 `readConfig` 默认值统一（原来 L3 / L4 比本机实测低一个
+  数量级，照字面执行会让 agent 频繁停下问人）；测试 110 → 215 项（smoke 48 / guards 148 / persist 19），
+  新增 C1–C14 契约用例与 `persist.mjs migrate` 模式，`smoke.mjs` 里那条恒真断言与 `STATE_FILE` 死代码
+  一并修掉，并补上日志隔离（`persist.mjs` / `smoke.mjs` 原来没设 `DSH_LOOP_GUARD_LOG_FILE`，
+  测试触发的「会话预算用尽」「存档版本迁移」这些 warn 会写进用户自己的 `~/.dsh/loop-guard.log`；
+  现在两个脚本各留一条「真日志 SHA256 一字未变」的断言，临时日志跑完就删）；
+  `uninstall.ps1` 改为带时间戳备份 + 对 `package.json` 做最小文本手术（不再整文件
+  `ConvertTo-Json` 重写）+ 写完自检；补上 `LICENSE`（MIT）；`no-waste-loop-guard` 技能是**用户级**文件
+  （`%USERPROFILE%\.dsh\skills\no-waste-loop-guard\SKILL.md`），不在本仓库。
+- **熔断归入配额类。** 熔断此前走重复类语义（连拦 3 次放行一次），1.1.5 起归入配额类：只豁免一次，之后每次都拦。
+
 ## 1.1.4
 
 **主题：让「一次问答」的 1 亿真的管住这一轮的全部花费 —— 包括它生出来的子代理。**
@@ -13,6 +66,9 @@
   再让 8 个子代理各烧 1 亿，单轮上限形同虚设。
 - **口径写清楚了**：本轮 = 这一轮含后代；家族 = 整场含后代；会话 = 整场只算自己。
   README 新增「预算里的三笔账，分别管哪一段时间」一节。
+- **换轮的判据写清楚了**：只看宿主 usage 事件里的 `turn` 变没变。一轮 = 一条用户消息
+  及其之后的全部工作；**用户在模型干活中途插入的消息不算新一轮**，仍计入同一条消息
+  的那一轮 —— 所以中途插话不会把本轮账清零，也不会松开已经到线的保险丝。
 - **后台子代理的归属**：它跨轮活着，消耗落在「它花钱时父会话正处在的那一轮」，
   不落在它出生的那一轮。账跟时间走，不跟出生走。
 - **顺带修了一处过期注释**：闸门 ① 上写着「默认关闭（sessionMaxTokens = Infinity）」，

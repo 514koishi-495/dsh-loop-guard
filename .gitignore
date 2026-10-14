@@ -8,6 +8,12 @@ yarn.lock
 loop-guard-state.json
 *.log
 
+# 测试跑出来的临时账本（断言中途失败或 Ctrl-C 会留下）
+test/.*-state.json*
+
+# npm pack 的产物
+*.tgz
+
 # 编辑器 / 系统
 .vscode/
 .idea/

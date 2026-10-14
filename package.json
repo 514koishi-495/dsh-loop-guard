@@ -1,18 +1,43 @@
 {
   "name": "dsh-loop-guard",
-  "version": "1.1.4",
-  "private": true,
+  "version": "1.1.5",
   "description": "防烧钱守卫：同一调用循环拦截 + 单次问答 token 预算硬停手（含该轮子代理）+ 交账报告",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node test/smoke.mjs && node test/guards.mjs && node test/persist.mjs write && node test/persist.mjs read && node test/persist.mjs migrate"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/514koishi-495/dsh-loop-guard.git"
+  },
+  "homepage": "https://github.com/514koishi-495/dsh-loop-guard#readme",
+  "bugs": "https://github.com/514koishi-495/dsh-loop-guard/issues",
+  "author": "514koishi-495 <514koishi-495@users.noreply.github.com>",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
+  "files": [
+    "lib/",
+    "test/",
+    "cordis.patch.yml",
+    "uninstall.ps1",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
     }
   },
   "engines": {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-loop-guard",
-  "version": "1.1.5",
+  "version": "1.1.6",
   "description": "防烧钱守卫：同一调用循环拦截 + 单次问答 token 预算硬停手（含该轮子代理）+ 交账报告",
   "type": "module",
   "main": "lib/index.js",

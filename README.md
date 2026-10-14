@@ -70,8 +70,8 @@ git clone https://github.com/514koishi-495/dsh-loop-guard "$HOME\.dsh\local-plug
 | 同骨架重复 | 只换数字/引号的同一件事。只对命令行生效；`read` 只折 `offset`/`limit`，路径原样保留；其余工具用精确签名 | 10 次 | `LOOP_GUARD_SKELETON` |
 | 乒乓循环 | A B A B A B 整体在打转 | 3 轮 | `LOOP_GUARD_CYCLE` |
 | 同一个错误 | 「工具名 + 归一化错误正文」这个指纹反复出现；**只拦报错的那个工具**，别的工具照常放行（不然连诊断用的读文件都会被堵死） | 2 次 | `LOOP_GUARD_SAME_ERROR` |
-| 子代理请求数 | 单个子代理的模型请求数 | 80 | `LOOP_GUARD_SUBAGENT_REQUESTS` |
-| 子代理工具数 | 单个子代理的工具调用数 | 150 | `LOOP_GUARD_SUBAGENT_TOOLS` |
+| 子代理请求数 | 单个子代理的模型请求数 | 150 | `LOOP_GUARD_SUBAGENT_REQUESTS` |
+| 子代理工具数 | 单个子代理的工具调用数 | 250 | `LOOP_GUARD_SUBAGENT_TOOLS` |
 | 横向异常 | 单个子代理每次请求的均值超过兄弟们的中位数 | 5 倍（至少 3 个兄弟） | `LOOP_GUARD_OUTLIER` |
 | 空跑熔断 | 连着一个字都不返回还继续烧 | 3 次 | `LOOP_GUARD_BREAKER` |
 | 扇出到顶 | 同时活着的子代理数 | 8 | `LOOP_GUARD_FANOUT` |
@@ -142,8 +142,8 @@ git clone https://github.com/514koishi-495/dsh-loop-guard "$HOME\.dsh\local-plug
 | `DSH_LOOP_GUARD_MAX_FANOUT` | `8` | 同时活着的子代理 |
 | `DSH_LOOP_GUARD_FANOUT_TTL_MS` | `1200000` | 多久没动静算它已经死了 |
 | `DSH_LOOP_GUARD_MAX_WORKFLOW_AGENTS` | `24` | workflow 内子代理 |
-| `DSH_LOOP_GUARD_MAX_SUBAGENT_REQUESTS` | `80` | 子代理请求数 |
-| `DSH_LOOP_GUARD_MAX_SUBAGENT_TOOLS` | `150` | 子代理工具数 |
+| `DSH_LOOP_GUARD_MAX_SUBAGENT_REQUESTS` | `150` | 子代理请求数 |
+| `DSH_LOOP_GUARD_MAX_SUBAGENT_TOOLS` | `250` | 子代理工具数 |
 | `DSH_LOOP_GUARD_OUTLIER_RATIO` | `5` | 横向异常倍数 |
 | `DSH_LOOP_GUARD_OUTLIER_MIN_SIBLINGS` | `3` | 至少几个兄弟才比较 |
 | `DSH_LOOP_GUARD_OUTLIER_FLOOR_TOKENS` | `5000000` | 太小不判异常 |

@@ -1,5 +1,28 @@
 # 变更记录
 
+## 1.1.6（2026-10-14）
+
+**主题：卸载不再动别人的文件；子代理配额默认值放宽到不误伤正常长活。**
+
+- **`uninstall.ps1` 默认不再删账本与诊断日志。** `~\.dsh\loop-guard-state.json` 与 `~\.dsh\loop-guard.log`
+  在 `~\.dsh` 下，是**所有 profile 共用**的：以前默认删掉它们（而且不留备份），在 desktop 上卸载
+  会顺手清掉别的 profile 的账本与历史日志。现在默认保留，要清得显式说 `-PurgeState` / `-PurgeLog`，
+  且删前先备份到 `.loop-guard-backup\files-<时间戳>\`。`-KeepState` / `-KeepLog` 保留为兼容用的 no-op。
+- **profile 目录不再写死 `profiles\desktop`。** 新增 `-ProfileDir <路径>`；不给时先试 `profiles\desktop`，
+  再自动探测 `profiles\*` 里 `package.json` 提到本插件的那个（唯一命中才用；0 个或多个都明确报错、退出码 1）。
+  自检里的 name 校验也不再把 `dsh-profile-desktop` 写死，改成与改写前的值比较。
+- **`package.json` 写完自检不再自伤。** 老规则「最多只许改 1 行」在插件同时是 `bundles` 与 `dependencies`
+  **最后一项**时，把自己判成「多了 2 行改动」（两处末尾各要去掉一个悬空逗号）→ 回滚 + 退出码 1，
+  卸载根本做不完。现在上限按「两处末尾各允许 1 行」计算。沙箱实测 A–F 六场景（双末项 / 双末项+purge /
+  `-ProfileDir` / 多候选报错 / 自动探测 / 中间项+Keep 开关）全部符合预期。
+- **脚本重新带 UTF-8 BOM。** Windows PowerShell 5.1 读无 BOM 的 UTF-8 脚本会按 ANSI 解中文，
+  直接 ParserError 跑不起来（pwsh 7 无此问题）。
+- **子代理配额默认值放宽：`DSH_LOOP_GUARD_MAX_SUBAGENT_REQUESTS` 80 → 150，
+  `DSH_LOOP_GUARD_MAX_SUBAGENT_TOOLS` 150 → 250。** 依据：一次合法的大型只读审计（读全库 + 跑探针）
+  需要 89 次模型请求，撞上 80 的硬顶后（配额门首超豁免一次、之后每次都拦）就再也发不出工具调用，
+  只能靠重新派人（≈ 重读全库）绕开。150 / 250 仍是硬顶，只是不再把正常的长活判成烧钱。
+  README / SKILL.md / 代码注释同步。
+
 ## 1.1.5（2026-10-14）
 
 **主题：把「逃生门有两套语义」「到线之后怎么收尾」写成真话，并给「钱花到哪了」补上看得见的地方。**

@@ -1191,7 +1191,7 @@ const QUOTA_BASE = {
 	const h = harness({ DSH_LOOP_GUARD_MAX_DENIALS: 99 }, { webServer });
 	check(
 		'有 webServer 时注册了 /api/loop-guard/usage',
-		registered.length === 1 && registered[0]?.path === '/api/loop-guard/usage',
+		registered.some(spec => spec.path === '/api/loop-guard/usage') && new Set(registered.map(spec => spec.path)).size === registered.length,
 		JSON.stringify(registered.map((spec) => spec?.path))
 	);
 	const handler = typeof registered[0]?.handler === 'function' ? registered[0].handler : registered[0]?.handler;
@@ -1755,7 +1755,7 @@ const QUOTA_BASE = {
 		);
 	/** 读端点：用最后一次 apply 注册的 handler（cfg 是 apply 时的快照，COST=0 那一段必须看它）。 */
 	const bodyOf = async (sessionId) => {
-		const spec = registered[registered.length - 1];
+		const spec = registered.filter(spec => spec.path === '/api/loop-guard/usage').at(-1);
 		const res = await httpGet(spec.handler, `/api/loop-guard/usage?sessionId=${encodeURIComponent(sessionId)}`);
 		return res.body ?? {};
 	};
@@ -2087,7 +2087,7 @@ const QUOTA_BASE = {
 		}
 	};
 	const bodyOf = async (sessionId) => {
-		const spec = registered[registered.length - 1];
+		const spec = registered.filter(spec => spec.path === '/api/loop-guard/usage').at(-1);
 		const res = await httpGet(spec.handler, `/api/loop-guard/usage?sessionId=${encodeURIComponent(sessionId)}`);
 		return res.body ?? {};
 	};

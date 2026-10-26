@@ -1,11 +1,15 @@
 {
   "name": "dsh-loop-guard",
-  "version": "1.1.7",
+  "version": "1.2.0",
   "description": "防烧钱守卫：同一调用循环拦截 + 单次问答 token 预算硬停手（含该轮子代理）+ 交账报告",
   "type": "module",
   "main": "lib/index.js",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-locale": ">=0.2.0-rc.1 <0.3"
+  },
   "scripts": {
-    "test": "node test/smoke.mjs && node test/guards.mjs && node test/persist.mjs write && node test/persist.mjs read && node test/persist.mjs migrate"
+    "test": "node test/smoke.mjs && node test/guards.mjs && node test/persist.mjs write && node test/persist.mjs read && node test/persist.mjs migrate && node test/strict-budget.mjs && node test/daily-features.mjs && node test/daily-integration.mjs && node test/client-badge.mjs"
   },
   "repository": {
     "type": "git",

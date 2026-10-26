@@ -726,6 +726,7 @@ if (mode === 'migrate') {
 	const makeCopy = (file) => {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.copyFileSync(LIB_SRC, file);
+		fs.copyFileSync(fileURLToPath(new URL('../lib/daily-features.js', import.meta.url)), path.join(path.dirname(file), 'daily-features.js'));
 	};
 	// 仿真时用的「假家目录」env。DSH_PROFILE / DSH_LOOP_GUARD_STATE_FILE 显式删掉，
 	// 让副本只能靠 import.meta.url 认 profile（这正是线上 profile 安装时的情形）。
